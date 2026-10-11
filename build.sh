@@ -21,6 +21,14 @@ if [ $# -lt 1 ]; then
   echo "- darwin-x64"
   echo "- darwin-arm64"
   echo
+  echo "Environment variables:"
+  echo "- CODECS       comma-separated optional codecs to build (or 'all'/'default')"
+  echo "               supported: spng, openjpeg, openexr, jpeg-xl, fftw, cfitsio,"
+  echo "                          matio, raw, ppm, analyze, radiance, qoi, nsgif"
+  echo
+  echo "Note: Windows builds must be run from an MSYS2 shell (the build-scripts/win.sh"
+  echo "script links every dependency statically into a single libvips DLL)."
+  echo
   exit 1
 fi
 PLATFORM="$1"
@@ -48,8 +56,22 @@ for flavour in darwin-x64 darwin-arm64; do
     export MESON="--cross-file=$PWD/platforms/$PLATFORM/meson.ini"
 
     source $PWD/versions.properties
-    source $PWD/build/posix.sh
+    source $PWD/build-scripts/posix.sh
 
+    exit 0
+  fi
+done
+
+# Windows (native MSYS2 build: statically links every codec into one DLL)
+for flavour in win-x64 win-arm64; do
+  if [ $PLATFORM = $flavour ]; then
+    if [ -z "${MSYSTEM:-}" ]; then
+      echo "Windows builds must be run from an MSYS2 shell (MSYSTEM is unset)." >&2
+      exit 1
+    fi
+    echo "Building $flavour (MSYS2 $MSYSTEM)..."
+    export PLATFORM
+    source $PWD/build-scripts/win.sh
     exit 0
   fi
 done
@@ -60,20 +82,11 @@ if ! [ -x "$(command -v docker)" ]; then
   exit 1
 fi
 
-# Windows
-for flavour in win-x64 win-arm64; do
-  if [ $PLATFORM = $flavour ]; then
-    echo "Building $flavour..."
-    docker build --pull -t vips-dev-win32 platforms/win32
-    docker run --rm -e "PLATFORM=${flavour}" -v $PWD:/packaging vips-dev-win32 sh -c "/packaging/build/win.sh"
-  fi
-done
-
 # Linux
 for flavour in linux-x64 linux-arm64; do
   if [ $PLATFORM = $flavour ]; then
     echo "Building $flavour..."
     docker build --pull -t "vips-dev-$flavour" "platforms/$flavour"
-    docker run --rm -v $PWD:/packaging "vips-dev-$flavour" sh -c "/packaging/build/posix.sh"
+    docker run --rm -e "CODECS=${CODECS:-}" -v $PWD:/packaging "vips-dev-$flavour" sh -c "/packaging/build-scripts/posix.sh"
   fi
 done

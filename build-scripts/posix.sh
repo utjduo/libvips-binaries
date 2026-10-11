@@ -108,6 +108,10 @@ unset PKG_CONFIG_PATH
 # Common options for curl
 CURL="curl --silent --location --retry 3 --retry-max-time 30"
 
+# Codec selection (shared with the Windows build)
+source "${PACKAGE}/build-scripts/codecs.sh"
+echo "libvips codec flags:${VIPS_CODEC_FLAGS}"
+
 # Download and build dependencies from source
 
 if [ "$DARWIN" = true ]; then
@@ -237,7 +241,7 @@ cmake -G"Unix Makefiles" \
   -Djbig=OFF -Dlerc=OFF -Dlibdeflate=OFF -Dlzma=OFF -Dold-jpeg=OFF -Dpixarlog=OFF -Dtiff-opengl=OFF -Dzstd=OFF
 make install/strip
 
-if [ -z "$WITHOUT_HIGHWAY" ]; then
+if [ -z "$WITHOUT_HIGHWAY" ] || codec_on jpeg-xl; then
   mkdir ${DEPS}/highway
   $CURL https://github.com/google/highway/archive/${VERSION_HIGHWAY}.tar.gz | tar xzC ${DEPS}/highway --strip-components=1
   cd ${DEPS}/highway
@@ -366,6 +370,121 @@ CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
   -DBUILD_SHARED_LIBS=FALSE -DUHDR_BUILD_EXAMPLES=FALSE -DUHDR_MAX_DIMENSION=65500 ${WITHOUT_NEON:+-DUHDR_ENABLE_INTRINSICS=FALSE}
 make install/strip
 
+# ---------------------------------------------------------------------------
+# Optional codec dependencies (only built when selected via CODECS)
+# ---------------------------------------------------------------------------
+
+if codec_on spng; then
+  mkdir ${DEPS}/spng
+  $CURL https://github.com/randy408/libspng/archive/v${VERSION_SPNG}.tar.gz | tar xzC ${DEPS}/spng --strip-components=1
+  cd ${DEPS}/spng
+  meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    -Dbuild_examples=false
+  meson install -C _build --tag devel
+fi
+
+if codec_on openjpeg; then
+  mkdir ${DEPS}/openjpeg
+  $CURL https://github.com/uclouvain/openjpeg/archive/v${VERSION_OPENJPEG}.tar.gz | tar xzC ${DEPS}/openjpeg --strip-components=1
+  cd ${DEPS}/openjpeg
+  mkdir build
+  cd build
+  cmake -G"Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=FALSE -DBUILD_CODEC=OFF -DBUILD_TESTING=OFF -DBUILD_DOC=OFF \
+    ..
+  make install/strip
+fi
+
+if codec_on openexr; then
+  mkdir ${DEPS}/imath
+  $CURL https://github.com/AcademySoftwareFoundation/Imath/archive/v${VERSION_IMATH}.tar.gz | tar xzC ${DEPS}/imath --strip-components=1
+  cd ${DEPS}/imath
+  mkdir build
+  cd build
+  cmake -G"Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=FALSE -DBUILD_TESTING=OFF -DIMATH_INSTALL_PKG_CONFIG=ON -DIMATH_INSTALL_SYM_LINK=OFF \
+    ..
+  make install/strip
+
+  mkdir ${DEPS}/openexr
+  $CURL https://github.com/AcademySoftwareFoundation/openexr/archive/v${VERSION_OPENEXR}.tar.gz | tar xzC ${DEPS}/openexr --strip-components=1
+  cd ${DEPS}/openexr
+  mkdir build
+  cd build
+  cmake -G"Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=FALSE -DBUILD_TESTING=OFF -DOPENEXR_BUILD_TOOLS=OFF -DOPENEXR_BUILD_EXAMPLES=OFF -DOPENEXR_BUILD_PYTHON=OFF -DOPENEXR_INSTALL_PKG_CONFIG=ON \
+    ..
+  make install/strip
+fi
+
+if codec_on jpeg-xl; then
+  mkdir ${DEPS}/brotli
+  $CURL https://github.com/google/brotli/archive/v${VERSION_BROTLI}.tar.gz | tar xzC ${DEPS}/brotli --strip-components=1
+  cd ${DEPS}/brotli
+  mkdir build
+  cd build
+  cmake -G"Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=FALSE -DBROTLI_DISABLE_TESTS=ON \
+    ..
+  make install/strip
+
+  mkdir ${DEPS}/jpeg-xl
+  $CURL https://github.com/libjxl/libjxl/archive/v${VERSION_JPEGXL}.tar.gz | tar xzC ${DEPS}/jpeg-xl --strip-components=1
+  cd ${DEPS}/jpeg-xl
+  mkdir build
+  cd build
+  cmake -G"Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=FALSE -DBUILD_TESTING=OFF \
+    -DJPEGXL_ENABLE_BENCHMARK=OFF -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_MANPAGES=OFF -DJPEGXL_ENABLE_JNI=OFF \
+    -DJPEGXL_ENABLE_SJPEG=OFF -DJPEGXL_ENABLE_SKCMS=OFF -DJPEGXL_ENABLE_OPENEXR=OFF -DJPEGXL_ENABLE_PLUGINS=OFF \
+    -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_VIEWERS=OFF -DJPEGXL_BUNDLE_LIBPNG=OFF \
+    -DJPEGXL_FORCE_SYSTEM_BROTLI=ON -DJPEGXL_FORCE_SYSTEM_HWY=ON \
+    ..
+  make install/strip
+fi
+
+if codec_on fftw; then
+  mkdir ${DEPS}/fftw
+  $CURL https://www.fftw.org/fftw-${VERSION_FFTW}.tar.gz | tar xzC ${DEPS}/fftw --strip-components=1
+  cd ${DEPS}/fftw
+  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
+    --disable-fortran --enable-threads
+  make install-strip
+fi
+
+if codec_on cfitsio; then
+  mkdir ${DEPS}/cfitsio
+  $CURL https://heasarc.gsfc.nasa.gov/FTP/software/fitsio/c/cfitsio-${VERSION_CFITSIO}.tar.gz | tar xzC ${DEPS}/cfitsio --strip-components=1
+  cd ${DEPS}/cfitsio
+  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
+    --disable-curl
+  make
+  make install
+fi
+
+if codec_on matio; then
+  mkdir ${DEPS}/matio
+  $CURL https://github.com/tbeu/matio/releases/download/v${VERSION_MATIO}/matio-${VERSION_MATIO}.tar.gz | tar xzC ${DEPS}/matio --strip-components=1
+  cd ${DEPS}/matio
+  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
+    --without-hdf5 --disable-mat73
+  make install-strip
+fi
+
+if codec_on raw; then
+  mkdir ${DEPS}/raw
+  $CURL https://www.libraw.org/data/LibRaw-${VERSION_RAW}.tar.gz | tar xzC ${DEPS}/raw --strip-components=1
+  cd ${DEPS}/raw
+  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
+    --disable-examples --disable-demos --disable-jasper
+  make install-strip
+fi
+
 mkdir ${DEPS}/vips
 $CURL https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips-${VERSION_VIPS}.tar.xz | tar xJC ${DEPS}/vips --strip-components=1
 cd ${DEPS}/vips
@@ -387,10 +506,9 @@ fi
 # Disable building man pages, gettext po files, tools, and (fuzz-)tests
 sed -i'.bak' "/subdir('man')/{N;N;N;N;d;}" meson.build
 CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" meson setup _build --default-library=shared --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  -Ddeprecated=false -Dexamples=false -Dauto_features=enabled -Dintrospection=disabled -Dmodules=disabled -Dcfitsio=disabled -Dfftw=disabled \
-  -Djpeg-xl=disabled ${WITHOUT_HIGHWAY:+-Dhighway=disabled} -Dorc=disabled -Dmagick=disabled -Dmatio=disabled -Dnifti=disabled -Dopenexr=disabled \
-  -Dopenjpeg=disabled -Dopenslide=disabled -Dpdfium=disabled -Dpoppler=disabled -Dquantizr=disabled -Draw=disabled -Dspng=disabled \
-  -Dppm=false -Danalyze=false -Dradiance=false \
+  -Ddeprecated=false -Dexamples=false -Dauto_features=enabled -Dintrospection=disabled -Dmodules=disabled \
+  ${WITHOUT_HIGHWAY:+-Dhighway=disabled} \
+  ${VIPS_CODEC_FLAGS} \
   ${LINUX:+-Dcpp_link_args="$LDFLAGS -Wl,-Bsymbolic-functions -Wl,--version-script=$DEPS/vips/vips.map $EXCLUDE_LIBS"}
 meson install -C _build --tag runtime,devel
 
@@ -454,36 +572,69 @@ fi
 
 # Create JSON file of version numbers
 cd ${TARGET}
-printf "{\n\
-  \"aom\": \"${VERSION_AOM}\",\n\
-  \"archive\": \"${VERSION_ARCHIVE}\",\n\
-  \"cairo\": \"${VERSION_CAIRO}\",\n\
-  \"cgif\": \"${VERSION_CGIF}\",\n\
-  \"exif\": \"${VERSION_EXIF}\",\n\
-  \"expat\": \"${VERSION_EXPAT}\",\n\
-  \"ffi\": \"${VERSION_FFI}\",\n\
-  \"fontconfig\": \"${VERSION_FONTCONFIG}\",\n\
-  \"freetype\": \"${VERSION_FREETYPE}\",\n\
-  \"fribidi\": \"${VERSION_FRIBIDI}\",\n\
-  \"glib\": \"${VERSION_GLIB}\",\n\
-  \"harfbuzz\": \"${VERSION_HARFBUZZ}\",\n\
-  \"heif\": \"${VERSION_HEIF}\",\n\
-  \"highway\": \"${VERSION_HIGHWAY}\",\n\
-  \"imagequant\": \"${VERSION_IMAGEQUANT}\",\n\
-  \"lcms\": \"${VERSION_LCMS}\",\n\
-  \"mozjpeg\": \"${VERSION_MOZJPEG}\",\n\
-  \"pango\": \"${VERSION_PANGO}\",\n\
-  \"pixman\": \"${VERSION_PIXMAN}\",\n\
-  \"png\": \"${VERSION_PNG}\",\n\
-  \"proxy-libintl\": \"${VERSION_PROXY_LIBINTL}\",\n\
-  \"rsvg\": \"${VERSION_RSVG}\",\n\
-  \"tiff\": \"${VERSION_TIFF}\",\n\
-  \"uhdr\": \"${VERSION_UHDR}\",\n\
-  \"vips\": \"${VERSION_VIPS}\",\n\
-  \"webp\": \"${VERSION_WEBP}\",\n\
-  \"xml2\": \"${VERSION_XML2}\",\n\
-  \"zlib-ng\": \"${VERSION_ZLIB_NG}\"\n\
-}" >versions.json
+VERSIONS_JSON=""
+VERSIONS_SEP=""
+add_version() {
+  VERSIONS_JSON="${VERSIONS_JSON}${VERSIONS_SEP}  \"$1\": \"$2\""
+  VERSIONS_SEP=",
+"
+}
+add_version aom "${VERSION_AOM}"
+add_version archive "${VERSION_ARCHIVE}"
+add_version cairo "${VERSION_CAIRO}"
+add_version cgif "${VERSION_CGIF}"
+add_version exif "${VERSION_EXIF}"
+add_version expat "${VERSION_EXPAT}"
+add_version ffi "${VERSION_FFI}"
+add_version fontconfig "${VERSION_FONTCONFIG}"
+add_version freetype "${VERSION_FREETYPE}"
+add_version fribidi "${VERSION_FRIBIDI}"
+add_version glib "${VERSION_GLIB}"
+add_version harfbuzz "${VERSION_HARFBUZZ}"
+add_version heif "${VERSION_HEIF}"
+add_version highway "${VERSION_HIGHWAY}"
+add_version imagequant "${VERSION_IMAGEQUANT}"
+add_version lcms "${VERSION_LCMS}"
+add_version mozjpeg "${VERSION_MOZJPEG}"
+add_version pango "${VERSION_PANGO}"
+add_version pixman "${VERSION_PIXMAN}"
+add_version png "${VERSION_PNG}"
+add_version proxy-libintl "${VERSION_PROXY_LIBINTL}"
+add_version rsvg "${VERSION_RSVG}"
+add_version tiff "${VERSION_TIFF}"
+add_version uhdr "${VERSION_UHDR}"
+add_version vips "${VERSION_VIPS}"
+add_version webp "${VERSION_WEBP}"
+add_version xml2 "${VERSION_XML2}"
+add_version zlib-ng "${VERSION_ZLIB_NG}"
+# Optional codec dependencies
+if codec_on jpeg-xl; then
+  add_version brotli "${VERSION_BROTLI}"
+  add_version jpeg-xl "${VERSION_JPEGXL}"
+fi
+if codec_on cfitsio; then
+  add_version cfitsio "${VERSION_CFITSIO}"
+fi
+if codec_on fftw; then
+  add_version fftw "${VERSION_FFTW}"
+fi
+if codec_on matio; then
+  add_version matio "${VERSION_MATIO}"
+fi
+if codec_on openexr; then
+  add_version imath "${VERSION_IMATH}"
+  add_version openexr "${VERSION_OPENEXR}"
+fi
+if codec_on openjpeg; then
+  add_version openjpeg "${VERSION_OPENJPEG}"
+fi
+if codec_on raw; then
+  add_version raw "${VERSION_RAW}"
+fi
+if codec_on spng; then
+  add_version spng "${VERSION_SPNG}"
+fi
+printf "{\n%s\n}" "${VERSIONS_JSON}" >versions.json
 
 # Add third-party notices
 $CURL -O https://raw.githubusercontent.com/CodeWithKyrian/libvips-binaries/main/THIRD-PARTY-NOTICES.md
