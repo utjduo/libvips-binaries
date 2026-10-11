@@ -333,7 +333,7 @@ while [ $# -gt 0 ]; do
 done
 
 CURRENT_VERSION="$(read_var VERSION_VIPS "$ROOT_DIR/versions.properties")"
-[ -n "$CURRENT_VERSION" ] || CURRENT_VERSION='8.18.2'
+[ -n "$CURRENT_VERSION" ] || CURRENT_VERSION='8.18.7'
 
 print_catalog() {
   local n=0 item
@@ -449,7 +449,7 @@ else
 fi
 case "$VERSION" in
   [0-9]*) ;;
-  *) die "Version must look like 8.18.2 (got '$VERSION')" ;;
+  *) die "Version must look like 8.18.7 (got '$VERSION')" ;;
 esac
 if [ "$VERSION" != "$CURRENT_VERSION" ]; then
   sed -i.bak "s/^VERSION_VIPS=.*/VERSION_VIPS=${VERSION}/" "$ROOT_DIR/versions.properties" \

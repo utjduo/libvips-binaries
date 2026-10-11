@@ -66,7 +66,7 @@ if (-not $Root) { $Root = (Get-Location).Path }
 # --- catalogue -------------------------------------------------------------
 function Get-ShellVar([string]$Name, [string]$Path) {
   $hit = Select-String -LiteralPath $Path -Pattern ('^{0}="(.*)"$' -f $Name) |
-    Select-Object -First 1
+  Select-Object -First 1
   if ($hit) { return $hit.Matches[0].Groups[1].Value }
   return ''
 }
@@ -77,29 +77,29 @@ if (-not (Test-Path -LiteralPath $codecsSh)) {
   exit 1
 }
 
-$extraCodecs   = @(Get-ShellVar 'CODEC_EXTRA' $codecsSh)       -split '\s+' | Where-Object { $_ }
+$extraCodecs = @(Get-ShellVar 'CODEC_EXTRA' $codecsSh) -split '\s+' | Where-Object { $_ }
 $builtinCodecs = @(Get-ShellVar 'CODEC_BUILTINS_ALL' $codecsSh) -split '\s+' | Where-Object { $_ }
 if (-not $extraCodecs -or -not $builtinCodecs) {
   Write-Error 'Could not read CODEC_EXTRA / CODEC_BUILTINS_ALL from build-scripts/codecs.sh.'
   exit 1
 }
-$allCodecs     = @($extraCodecs) + @($builtinCodecs)
+$allCodecs = @($extraCodecs) + @($builtinCodecs)
 $defaultCodecs = @('nsgif', 'qoi')
 
 $CodecNotes = [ordered]@{
-  spng     = 'PNG via libspng'
-  openjpeg = 'JPEG 2000 (jp2)'
-  openexr  = 'OpenEXR (exr), also builds Imath - NOT available on Windows'
+  spng      = 'PNG via libspng'
+  openjpeg  = 'JPEG 2000 (jp2)'
+  openexr   = 'OpenEXR (exr), also builds Imath - NOT available on Windows'
   'jpeg-xl' = 'JPEG XL (jxl), also builds brotli + highway'
-  fftw     = 'FFTW, used by FFT-based operations'
-  cfitsio  = 'FITS astronomical images'
-  matio    = 'MATLAB .mat files'
-  raw      = 'Camera RAW via libraw'
-  ppm      = 'PPM/PNM (built in, no dependency)'
-  analyze  = 'Analyze/.img (built in, no dependency)'
-  radiance = 'Radiance .hdr (built in, no dependency)'
-  qoi      = 'QOI (built in, needs libvips >= 8.19)'
-  nsgif    = 'GIF loading (built in, no dependency)'
+  fftw      = 'FFTW, used by FFT-based operations'
+  cfitsio   = 'FITS astronomical images'
+  matio     = 'MATLAB .mat files'
+  raw       = 'Camera RAW via libraw'
+  ppm       = 'PPM/PNM (built in, no dependency)'
+  analyze   = 'Analyze/.img (built in, no dependency)'
+  radiance  = 'Radiance .hdr (built in, no dependency)'
+  qoi       = 'QOI (built in, needs libvips >= 8.19)'
+  nsgif     = 'GIF loading (built in, no dependency)'
 }
 
 $CodecAliases = @{
@@ -117,14 +117,14 @@ $CodecAliases = @{
 function Resolve-Choice {
   param([string[]]$Items, [string[]]$Default, [string]$Answer, [hashtable]$Aliases)
 
-  if ([string]::IsNullOrWhiteSpace($Answer)) { return ,@($Default) }
+  if ([string]::IsNullOrWhiteSpace($Answer)) { return , @($Default) }
 
   $tokens = ($Answer.ToLower() -replace '[,;]+', ' ').Trim() -split '\s+' |
-    Where-Object { $_ }
+  Where-Object { $_ }
   $chosen = New-Object System.Collections.Generic.List[string]
 
   foreach ($token in $tokens) {
-    if ($token -eq 'all') { return ,@($Items) }
+    if ($token -eq 'all') { return , @($Items) }
     if ($token -in @('none', 'off', 'no')) { $chosen.Clear(); continue }
     if ($token -eq 'default') {
       $chosen.Clear()
@@ -151,7 +151,7 @@ function Resolve-Choice {
     else { Write-Host "  unknown choice: $token" -ForegroundColor Red; return $null }
   }
 
-  return ,@($chosen | Select-Object -Unique)
+  return , @($chosen | Select-Object -Unique)
 }
 
 function Show-Menu {
@@ -169,7 +169,7 @@ function Show-Menu {
 
 function Ask-Choice {
   param([string]$Title, [string[]]$Items, [string[]]$Default, $Notes,
-        [hashtable]$Aliases, [string]$Extra)
+    [hashtable]$Aliases, [string]$Extra)
 
   while ($true) {
     Show-Menu -Title $Title -Items $Items -Notes $Notes -Extra $Extra
@@ -207,7 +207,7 @@ function ConvertTo-MsysPath([string]$Path) {
 # --- main -----------------------------------------------------------------
 $versionsFile = Join-Path $Root 'versions.properties'
 $currentVersion = Get-ShellVar 'VERSION_VIPS' $versionsFile
-if (-not $currentVersion) { $currentVersion = '8.18.2' }
+if (-not $currentVersion) { $currentVersion = '8.18.7' }
 
 if (-not $Platform) { $Platform = 'win-x64' }
 if ($Platform -notin @('win-x64', 'win-arm64')) {

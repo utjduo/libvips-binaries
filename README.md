@@ -16,11 +16,11 @@ and the sharp team for their excellent work.
 
 ## Platforms
 
-| Platform | Architecture  | Build method                                      |
-|----------|---------------|---------------------------------------------------|
-| macOS    | arm64, x86_64 | Native (Clang + Homebrew deps)                    |
-| Linux    | x86_64, arm64 | Rocky Linux 8 Docker (glibc 2.28)                 |
-| Windows  | x64           | MSYS2 (UCRT64) native build, single static DLL    |
+| Platform | Architecture  | Build method                                   |
+| -------- | ------------- | ---------------------------------------------- |
+| macOS    | arm64, x86_64 | Native (Clang + Homebrew deps)                 |
+| Linux    | x86_64, arm64 | Rocky Linux 8 Docker (glibc 2.28)              |
+| Windows  | x64           | MSYS2 (UCRT64) native build, single static DLL |
 
 ## Usage
 
@@ -47,16 +47,16 @@ attached to a GitHub Release).
 
 ### Inputs
 
-| Input | Type | Description |
-|-------|------|-------------|
-| `version` | string | libvips version, e.g. `8.18.2` |
-| `mac_x64` | boolean | Build macOS x86_64 (`darwin-x64`) |
-| `mac_arm` | boolean | Build macOS arm64 (`darwin-arm64`) |
-| `linux_x64` | boolean | Build Linux x86_64 (`linux-x64`) |
-| `linux_arm` | boolean | Build Linux arm64 (`linux-arm64`) |
-| `win_x64` | boolean | Build Windows x86_64 (`win-x64`) |
-| `codecs` | string | Optional codecs: comma-separated list, or `all` / `default` |
-| `create_release` | boolean | Publish the built tarballs as a GitHub Release |
+| Input            | Type    | Description                                                 |
+| ---------------- | ------- | ----------------------------------------------------------- |
+| `version`        | string  | libvips version, e.g. `8.18.7`                              |
+| `mac_x64`        | boolean | Build macOS x86_64 (`darwin-x64`)                           |
+| `mac_arm`        | boolean | Build macOS arm64 (`darwin-arm64`)                          |
+| `linux_x64`      | boolean | Build Linux x86_64 (`linux-x64`)                            |
+| `linux_arm`      | boolean | Build Linux arm64 (`linux-arm64`)                           |
+| `win_x64`        | boolean | Build Windows x86_64 (`win-x64`)                            |
+| `codecs`         | string  | Optional codecs: comma-separated list, or `all` / `default` |
+| `create_release` | boolean | Publish the built tarballs as a GitHub Release              |
 
 > GitHub allows a maximum of **10** `workflow_dispatch` inputs, which is why
 > codecs are selected with a single comma-separated `codecs` string instead of
@@ -70,11 +70,11 @@ and the Pango/Cairo/FontConfig/HarfBuzz text-rendering stack.
 
 `codecs` adds *optional* codecs on top:
 
-| Category | Values | Notes |
-|----------|--------|-------|
-| Extra codecs | `spng`, `openjpeg`, `openexr`, `jpeg-xl`, `fftw`, `cfitsio`, `matio`, `raw` | macOS/Linux build the dependency from source and statically link it (e.g. `openexr` also builds Imath, `jpeg-xl` also builds brotli + highway); Windows uses the matching MSYS2 package when one is available (`openexr` is not available there) |
-| Built-in formats (no dependency) | `ppm`, `analyze`, `radiance`, `qoi`, `nsgif` | Compiled directly into libvips |
-| Aliases | `jxl`/`jpegxl`, `exr`, `jp2`/`jpeg2000`, `libspng`, `libraw`, `fits`, `matlib`, `fft` | Convenience spellings |
+| Category                         | Values                                                                                | Notes                                                                                                                                                                                                                                            |
+| -------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Extra codecs                     | `spng`, `openjpeg`, `openexr`, `jpeg-xl`, `fftw`, `cfitsio`, `matio`, `raw`           | macOS/Linux build the dependency from source and statically link it (e.g. `openexr` also builds Imath, `jpeg-xl` also builds brotli + highway); Windows uses the matching MSYS2 package when one is available (`openexr` is not available there) |
+| Built-in formats (no dependency) | `ppm`, `analyze`, `radiance`, `qoi`, `nsgif`                                          | Compiled directly into libvips                                                                                                                                                                                                                   |
+| Aliases                          | `jxl`/`jpegxl`, `exr`, `jp2`/`jpeg2000`, `libspng`, `libraw`, `fits`, `matlib`, `fft` | Convenience spellings                                                                                                                                                                                                                            |
 
 Special values:
 
@@ -162,12 +162,12 @@ do not have to open an "MSYS2 UCRT64" shell first. It finds MSYS2 at
 Anything not given as an option is asked for. Codecs and platforms can be picked
 by number, range, name or shortcut:
 
-| you type | what it means |
-|----------|---------------|
-| `1-4,9` | the 1st through 4th entries plus the 9th |
-| `all` / `none` | every optional codec / no extra codecs |
-| `default` | `nsgif,qoi`, the same default the Action uses |
-| `jxl`, `jp2`, `exr` | `jpeg-xl`, `openjpeg`, `openexr` |
+| you type            | what it means                                 |
+| ------------------- | --------------------------------------------- |
+| `1-4,9`             | the 1st through 4th entries plus the 9th      |
+| `all` / `none`      | every optional codec / no extra codecs        |
+| `default`           | `nsgif,qoi`, the same default the Action uses |
+| `jxl`, `jp2`, `exr` | `jpeg-xl`, `openjpeg`, `openexr`              |
 
 `--list-codecs` prints the catalogue without building anything:
 
@@ -201,16 +201,16 @@ build actually supports. `--version 8.19.0` rewrites `VERSION_VIPS` in
 
 ## Build scripts
 
-| Script           | Platform      | Notes                                                        |
-|------------------|---------------|--------------------------------------------------------------|
-| `build.sh`       | All           | Dispatcher — macOS natively, Linux via Docker, Windows via MSYS2 |
-| `build-selectable.sh` | All      | Terminal menu: pick platforms + codecs, then calls `build.sh` per platform |
-| `build-selectable.ps1` | Windows   | PowerShell front end: asks in PowerShell, runs the build in MSYS2 |
-| `build-selectable.bat` | Windows   | Starts `build-selectable.ps1` from cmd.exe / double-click |
-| `build-scripts/codecs.sh` | All | Shared `CODECS` parsing + libvips meson feature flags        |
-| `build-scripts/gen-implib.sh` | Windows | Rebuilds the `libvips.dll.a` import library against the shipped DLL |
-| `build-scripts/posix.sh` | macOS + Linux | Full source build, statically links deps into one shared lib  |
-| `build-scripts/win.sh`   | Windows   | MSYS2 (UCRT64) source build, statically links deps into one DLL |
+| Script                        | Platform      | Notes                                                                      |
+| ----------------------------- | ------------- | -------------------------------------------------------------------------- |
+| `build.sh`                    | All           | Dispatcher — macOS natively, Linux via Docker, Windows via MSYS2           |
+| `build-selectable.sh`         | All           | Terminal menu: pick platforms + codecs, then calls `build.sh` per platform |
+| `build-selectable.ps1`        | Windows       | PowerShell front end: asks in PowerShell, runs the build in MSYS2          |
+| `build-selectable.bat`        | Windows       | Starts `build-selectable.ps1` from cmd.exe / double-click                  |
+| `build-scripts/codecs.sh`     | All           | Shared `CODECS` parsing + libvips meson feature flags                      |
+| `build-scripts/gen-implib.sh` | Windows       | Rebuilds the `libvips.dll.a` import library against the shipped DLL        |
+| `build-scripts/posix.sh`      | macOS + Linux | Full source build, statically links deps into one shared lib               |
+| `build-scripts/win.sh`        | Windows       | MSYS2 (UCRT64) source build, statically links deps into one DLL            |
 
 `build-scripts/posix.sh` is derived from [lovell/sharp-libvips](https://github.com/lovell/sharp-libvips)
 under the Apache 2.0 license; the Windows build (`build-scripts/win.sh`) is our
