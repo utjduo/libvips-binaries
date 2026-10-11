@@ -16,6 +16,14 @@ on:
         required: false
         default: false
         type: boolean
+      codecs:
+        description: >-
+          Optional codecs to build: comma-separated list, or "all"/"default".
+          Extra codecs: spng, openjpeg, openexr, jpeg-xl, fftw, cfitsio, matio, raw.
+          Built-in formats: ppm, analyze, radiance, qoi, nsgif.
+        required: false
+        default: 'all'
+        type: string
 
 permissions:
   contents: write
@@ -24,6 +32,8 @@ jobs:
   build:
     name: build-${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
+    env:
+      CODECS: ${{ inputs.codecs }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +46,7 @@ jobs:
             platform: linux-x64
           - os: ubuntu-24.04-arm
             platform: linux-arm64
-          - os: ubuntu-24.04
+          - os: windows-2025
             platform: win-x64
 
     steps:
@@ -48,12 +58,33 @@ jobs:
           pipx install meson
           brew install automake nasm
 
+      - name: Setup MSYS2 (Windows)
+        if: matrix.platform == 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            patch
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+
       - name: Update version
+        shell: bash
         run: |
           sed -i.bak "s/^VERSION_VIPS=.*/VERSION_VIPS=${{ inputs.version }}/" versions.properties
 
-      - name: Build
-        if: inputs.platforms == '' || contains(inputs.platforms, matrix.platform)
+      - name: Build (Windows / MSYS2)
+        if: matrix.platform == 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        shell: msys2 {0}
+        run: bash build.sh win-x64
+
+      - name: Build (Unix)
+        if: matrix.platform != 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
         run: bash build.sh ${{ matrix.platform }}
 
       - name: Upload artifact

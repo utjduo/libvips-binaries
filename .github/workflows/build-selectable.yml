@@ -1,0 +1,181 @@
+name: Build (selectable OS + codecs)
+
+# Alternative to build.yml: pick exactly which operating systems and which
+# optional codecs to compile, then download every platform as a workflow
+# artifact. Setting a boolean OS toggle to false removes the runner entirely
+# (the `prepare` job computes the matrix), so you only pay for what you build.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'libvips version (e.g. 8.18.2)'
+        required: true
+        default: '8.18.2'
+        type: string
+      mac_x64:
+        description: 'Build macOS x86_64 (darwin-x64)'
+        required: false
+        default: true
+        type: boolean
+      mac_arm:
+        description: 'Build macOS arm64 (darwin-arm64)'
+        required: false
+        default: true
+        type: boolean
+      linux_x64:
+        description: 'Build Linux x86_64 (linux-x64)'
+        required: false
+        default: true
+        type: boolean
+      linux_arm:
+        description: 'Build Linux arm64 (linux-arm64)'
+        required: false
+        default: true
+        type: boolean
+      win_x64:
+        description: 'Build Windows x86_64 (win-x64)'
+        required: false
+        default: true
+        type: boolean
+      codecs:
+        description: >-
+          Optional codecs to build: comma-separated list, or "all"/"default".
+          Extra codecs: spng, openjpeg, openexr, jpeg-xl, fftw, cfitsio, matio, raw.
+          Built-in formats: ppm, analyze, radiance, qoi, nsgif.
+          Core codecs (jpeg, png, webp, tiff, heif/avif, uhdr, gif, svg, exif,
+          lcms, imagequant, archive, text) are always included.
+        required: false
+        default: 'all'
+        type: string
+      create_release:
+        description: 'Create a GitHub Release with all built artifacts'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Resolve build matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Build matrix from platform selection
+        id: set
+        env:
+          MAC_X64: ${{ inputs.mac_x64 }}
+          MAC_ARM: ${{ inputs.mac_arm }}
+          LINUX_X64: ${{ inputs.linux_x64 }}
+          LINUX_ARM: ${{ inputs.linux_arm }}
+          WIN_X64: ${{ inputs.win_x64 }}
+        run: |
+          matrix='{"include":['
+          sep=''
+          add() {
+            # $1 = runner label, $2 = platform name, $3 = enabled ("true"/"false")
+            if [ "$3" = "true" ]; then
+              matrix="${matrix}${sep}{\"os\":\"$1\",\"platform\":\"$2\"}"
+              sep=','
+            fi
+          }
+          add "macos-15"         "darwin-arm64" "$MAC_ARM"
+          add "macos-15-intel"   "darwin-x64"   "$MAC_X64"
+          add "ubuntu-24.04"     "linux-x64"    "$LINUX_X64"
+          add "ubuntu-24.04-arm" "linux-arm64"  "$LINUX_ARM"
+          add "windows-2025"     "win-x64"      "$WIN_X64"
+          matrix="${matrix}]}"
+          if [ -z "$sep" ]; then
+            echo "::error::No platforms selected - enable at least one OS."
+            exit 1
+          fi
+          echo "Selected matrix: ${matrix}"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build-${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      CODECS: ${{ inputs.codecs }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pipx install meson
+          brew install automake nasm
+
+      - name: Setup MSYS2 (Windows)
+        if: matrix.platform == 'win-x64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            patch
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Update version
+        shell: bash
+        run: |
+          sed -i.bak "s/^VERSION_VIPS=.*/VERSION_VIPS=${{ inputs.version }}/" versions.properties
+
+      - name: Build (Windows / MSYS2)
+        if: matrix.platform == 'win-x64'
+        shell: msys2 {0}
+        run: bash build.sh win-x64
+
+      - name: Build (Unix)
+        if: matrix.platform != 'win-x64'
+        run: bash build.sh ${{ matrix.platform }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-${{ matrix.platform }}
+          path: 'libvips-*.tar.gz'
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  create-release:
+    if: inputs.create_release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          cat > release-notes.md <<EOF
+          # libvips ${{ inputs.version }} binaries
+
+          Codecs: \`${{ inputs.codecs }}\`
+
+          | Asset | Platform |
+          |-------|----------|
+          $(for f in libvips-*.tar.gz; do echo "| \`$f\` | ${f#libvips-} |"; done)
+          EOF
+
+      - name: Create Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ inputs.version }}
+          name: "libvips ${{ inputs.version }}"
+          artifacts: 'libvips-*.tar.gz'
+          bodyFile: release-notes.md
+          makeLatest: true
