@@ -313,18 +313,29 @@ build_freetype() {
     -Dzlib=enabled -Dpng=enabled -Dbrotli=disabled -Dbzip2=disabled "$@"
   meson install -C _build --tag devel
 }
-# freetype, expat (via fontconfig), fontconfig, harfbuzz, graphite2, pixman and
-# cairo exist only to serve svgload and textload; skip them when both are trimmed.
+# expat is *not* part of the vector/text stack: libvips has required it since
+# 8.18 (dependency('expat') in the top-level meson.build, used by libvips/vips.c
+# to parse XML metadata). posix builds resolve every dependency out of
+# ${TARGET}/lib/pkgconfig (PKG_CONFIG_LIBDIR above, with PKG_CONFIG_PATH unset),
+# so a system expat is invisible here and a trimmed build used to fail at
+#   Run-time dependency expat found: NO (tried pkgconfig)
+# It must therefore be built even when svgload and textload are trimmed.
+mkdir ${DEPS}/expat
+$CURL https://github.com/libexpat/libexpat/releases/download/R_${VERSION_EXPAT//./_}/expat-${VERSION_EXPAT}.tar.xz | tar xJC ${DEPS}/expat --strip-components=1
+cd ${DEPS}/expat
+./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared \
+  --disable-dependency-tracking --without-xmlwf --without-docbook --without-getrandom --without-sys-getrandom \
+  --without-libbsd --without-examples --without-tests
+make install-strip dist_cmake_DATA= nodist_cmake_DATA=
+if [ ! -f "${TARGET}/lib/pkgconfig/expat.pc" ]; then
+  echo "ERROR: expat.pc was not installed into ${TARGET}/lib/pkgconfig; libvips needs dependency('expat')." >&2
+  exit 1
+fi
+
+# freetype, fontconfig, harfbuzz, graphite2, pixman and cairo exist only to serve
+# svgload and textload; skip them when both are trimmed.
 if [ "${NEED_VECTOR_TEXT}" = 1 ]; then
   build_freetype -Dharfbuzz=disabled
-
-  mkdir ${DEPS}/expat
-  $CURL https://github.com/libexpat/libexpat/releases/download/R_${VERSION_EXPAT//./_}/expat-${VERSION_EXPAT}.tar.xz | tar xJC ${DEPS}/expat --strip-components=1
-  cd ${DEPS}/expat
-  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared \
-    --disable-dependency-tracking --without-xmlwf --without-docbook --without-getrandom --without-sys-getrandom \
-    --without-libbsd --without-examples --without-tests
-  make install-strip dist_cmake_DATA= nodist_cmake_DATA=
 fi
 
 if [ "${HAVE_DZSAVE}" = 1 ]; then
@@ -625,7 +636,7 @@ meson install -C _build --tag runtime,devel
 # ---------------------------------------------------------------------------
 if [ "${SMOKE_TEST:-1}" != 0 ]; then
   echo "Smoke testing the library installed in $TARGET..."
-  if ! TARGET="$TARGET" bash "${PACKAGE}/build-scripts/smoke-test.sh" ${CODECS}; then
+  if ! TARGET="$TARGET" VERSION_VIPS="${VERSION_VIPS:-}" bash "${PACKAGE}/build-scripts/smoke-test.sh" ${CODECS}; then
     echo "ERROR: the smoke test failed - the library in $TARGET is not usable." >&2
     exit 1
   fi
@@ -709,7 +720,7 @@ if [ "${HAVE_DZSAVE}" = 1 ]; then add_version archive "${VERSION_ARCHIVE}"; fi
 if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version cairo "${VERSION_CAIRO}"; fi
 add_version cgif "${VERSION_CGIF}"
 if [ "${HAVE_EXIF}" = 1 ]; then add_version exif "${VERSION_EXIF}"; fi
-if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version expat "${VERSION_EXPAT}"; fi
+add_version expat "${VERSION_EXPAT}"
 add_version ffi "${VERSION_FFI}"
 if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version fontconfig "${VERSION_FONTCONFIG}"; fi
 if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version freetype "${VERSION_FREETYPE}"; fi
