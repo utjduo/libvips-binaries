@@ -117,6 +117,25 @@ jobs:
         if: matrix.platform != 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
         run: bash build.sh ${{ matrix.platform }}
 
+      # The build scripts already smoke test the build tree, which is the right
+      # place to fail fast, but that is not always the library that ships:
+      # posix.sh deletes target/lib/pkgconfig, copies the library with cp -L,
+      # rewrites its install name to @rpath/... and renames libvips-cpp.so.* to
+      # libvips.so.42 after that test has run, and Linux builds happen inside a
+      # container.  These steps unpack the finished tarball in an empty directory
+      # and compile a consumer program against it with the runner's own compiler,
+      # then the table lands in the job summary.  They run before the upload, so
+      # an archive that cannot be linked is never published.
+      - name: Smoke test the package (Windows / MSYS2)
+        if: matrix.platform == 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        shell: msys2 {0}
+        run: bash build-scripts/smoke-package.sh libvips-${{ matrix.platform }}.tar.gz
+
+      - name: Smoke test the package
+        if: matrix.platform != 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        shell: bash
+        run: bash build-scripts/smoke-package.sh libvips-${{ matrix.platform }}.tar.gz
+
       - name: Upload artifact
         if: inputs.platforms == '' || contains(inputs.platforms, matrix.platform)
         uses: actions/upload-artifact@v6

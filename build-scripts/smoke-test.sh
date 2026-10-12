@@ -111,6 +111,11 @@ if [ "$#" -eq 0 ]; then
   # Called with no arguments: trust the codec list the build exported, if any.
   CODEC_ARG=" ${CODECS:-} "
 else
+  # win.sh and posix.sh forward the codec selection unquoted, and CODECS is a
+  # comma separated list, so a selection like "spng,openjpeg" arrives here as one
+  # word.  Split commas (and semicolons) before reading the arguments, or every
+  # codec in the list would be neither required nor skipped.
+  set -- $(printf '%s' "$*" | tr ',;' '  ')
   for c in "$@"; do
     case "$c" in
       all) CODEC_ARG="$CODEC_ARG spng openjpeg openexr jpeg-xl fftw cfitsio matio raw ppm analyze radiance qoi nsgif cgif" ;;
