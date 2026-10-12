@@ -214,6 +214,26 @@ jobs:
         shell: msys2 {0}
         run: bash build.sh win-x64
 
+      # A failed Windows build otherwise shows nothing but "exit code 1" in the
+      # Actions log: the messages that explain it - meson's dependency
+      # resolution, a configure run that gave up, CMake's package detection -
+      # are written into files under deps/ and are discarded with the runner.
+      # Keep them whenever the build fails so the cause is readable.
+      - name: Upload build logs (on failure)
+        if: failure() && matrix.platform == 'win-x64'
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-logs-${{ matrix.platform }}
+          path: |
+            deps/pkgconfig-probe.log
+            deps/vips/_build/meson-logs/meson-log.txt
+            deps/*/_build/meson-logs/meson-log.txt
+            deps/*/config.log
+            deps/*/CMakeCache.txt
+            deps/**/CMakeFiles/CMake*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
       # The Linux builds run inside a container whose image is the entire toolchain
       # (dnf packages, rustup + cargo-c, meson/ninja).  BuildKit stores those layers in
       # the GitHub Actions cache backend, so only the dependency build itself runs

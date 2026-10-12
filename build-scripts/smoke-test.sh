@@ -213,7 +213,23 @@ apply_feature dzsave dz
 apply_feature svg svgload
 apply_feature text text
 apply_feature uhdr uhdr
-apply_feature imagequant gif
+# The gif check writes a .gif through cgif and then reads it back, and the only
+# GIF loader libvips can build here is its bundled nsgif.  An explicit codec
+# list such as CODECS="jpeg-xl" drops nsgif while lean still keeps the
+# quantiser, and that combination can write a .gif nothing in the package can
+# open, so the round-trip is only required when both halves are present.
+case "$(feature_state imagequant)" in
+  on)
+    if codec_on nsgif; then
+      add_require gif
+    else
+      echo "smoke-test: no GIF loader in this package (nsgif trimmed), checking gif as optional"
+      add_skip gif
+    fi
+    ;;
+  off) add_skip gif ;;
+  *) ;;
+esac
 
 # A .heic round-trip needs both halves of libheif: libde265 to read and x265 to
 # write. AVIF is unaffected - libaom is always linked - so "avif" stays required.
@@ -246,12 +262,18 @@ INC_DIR="$(to_posix_path "$TARGET/include")"
 PKG_CONFIG_PATH="$TARGET/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export PKG_CONFIG_PATH
 
-PKG_CONFIG_BIN="${PKG_CONFIG:-pkg-config}"
+# PKG_CONFIG usually holds the tool and its flags in one string - win.sh exports
+# "pkgconf --static" - so split it into words the way meson, CMake and autoconf
+# each do.  Without the split, `command -v "pkgconf --static"` finds nothing and
+# this script falls back to hand-built flags even though pkg-config works.
+PKG_CONFIG_WORDS=( ${PKG_CONFIG:-pkg-config} )
+PKG_CONFIG_BIN="${PKG_CONFIG_WORDS[0]}"
+PKG_CONFIG_ARGS=("${PKG_CONFIG_WORDS[@]:1}")
 VIPS_CFLAGS=""
 VIPS_LIBS=""
 if command -v "$PKG_CONFIG_BIN" >/dev/null 2>&1; then
-  VIPS_CFLAGS="$("$PKG_CONFIG_BIN" --cflags vips 2>/dev/null)"
-  VIPS_LIBS="$("$PKG_CONFIG_BIN" --libs vips 2>/dev/null)"
+  VIPS_CFLAGS="$("$PKG_CONFIG_BIN" ${PKG_CONFIG_ARGS[@]+"${PKG_CONFIG_ARGS[@]}"} --cflags vips 2>/dev/null)"
+  VIPS_LIBS="$("$PKG_CONFIG_BIN" ${PKG_CONFIG_ARGS[@]+"${PKG_CONFIG_ARGS[@]}"} --libs vips 2>/dev/null)"
 fi
 if [ -z "$VIPS_CFLAGS" ] || [ -z "$VIPS_LIBS" ]; then
   # pkg-config is unavailable, or posix.sh has already removed
@@ -282,7 +304,7 @@ if [ -z "$VIPS_CFLAGS" ] || [ -z "$VIPS_LIBS" ]; then
   [ -d "$LIB_DIR/glib-2.0/include" ] &&
     VIPS_CFLAGS="$VIPS_CFLAGS -I$LIB_DIR/glib-2.0/include"
   if [ ! -d "$INC_DIR/glib-2.0" ] && command -v "$PKG_CONFIG_BIN" >/dev/null 2>&1; then
-    VIPS_CFLAGS="$VIPS_CFLAGS $("$PKG_CONFIG_BIN" --cflags glib-2.0 gobject-2.0 2>/dev/null)"
+    VIPS_CFLAGS="$VIPS_CFLAGS $("$PKG_CONFIG_BIN" ${PKG_CONFIG_ARGS[@]+"${PKG_CONFIG_ARGS[@]}"} --cflags glib-2.0 gobject-2.0 2>/dev/null)"
   fi
   if [ -n "$link_name" ]; then
     # -l wants the file name without its "lib" prefix and without the suffix.

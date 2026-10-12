@@ -92,9 +92,13 @@ install_pkgs() {
 PKG="${MINGW_PACKAGE_PREFIX:-mingw-w64-ucrt-x86_64}"
 
 # Build tools: MSYS `make` (for autotools source builds) and a CMake.
+# pkgconf is what every consumer of PKG_CONFIG must end up running: it is a
+# real .exe, which meson, CMake and configure scripts can all exec (see the
+# PKG_CONFIG block below).  The meson package pulls it in, but the build must
+# not depend on that.
 # diffutils is needed by libarchive's configure script, which otherwise fails its
 # internal checks with "cmp: command not found" / "diff: command not found".
-install_pkgs make diffutils "${PKG}-cmake"
+install_pkgs make diffutils "${PKG}-cmake" "${PKG}-pkgconf"
 
 # Core dependencies (always included).
 # libiconv: GLib links MSYS2's static libintl.a, whose gettext helpers call
@@ -225,18 +229,68 @@ if [ -f "$GCCS_ARCHIVE" ] && grep -qa 'dll_iname' "$GCCS_ARCHIVE"; then
   fi
 fi
 
-# pkg-config wrapper that always asks for the static link line
-cat > "$DEPS/pkg-config-static" <<'EOF'
-#!/usr/bin/env bash
+# pkg-config: hand every consumer the *executable*, with --static kept as a
+# separate word so all three of them ask it for the static link line.
+#
+# A wrapper script does not survive that:
+#   - CMake's FindPkgConfig splits $PKG_CONFIG, caches argv[0] as
+#     PKG_CONFIG_EXECUTABLE and runs `<it> --version`.  A shebang script has no
+#     .exe suffix, so that run fails, the variable is cleared and every
+#     pkg_check_modules() in libheif/libjxl reports
+#     "Could NOT find PkgConfig (missing: PKG_CONFIG_EXECUTABLE)".
+#   - meson can only run a script when it can find an interpreter on PATH; when
+#     it cannot, pkg-config is reported as unusable and the first dependency of
+#     libvips fails with `Dependency "glib-2.0" not found, tried pkg-config`.
+#   - autoconf expands $PKG_CONFIG unquoted, so the extra --static reaches
+#     configure scripts either way.
+# Naming the pkgconf binary itself is accepted by all three (meson and CMake
+# both find pkgconf.exe on PATH; the flag travels as its own argument), so the
+# build no longer depends on script execution at all.
 if command -v pkgconf >/dev/null 2>&1; then
-  exec pkgconf --static "$@"
+  export PKG_CONFIG="pkgconf --static"
+else
+  export PKG_CONFIG="pkg-config --static"
 fi
-exec pkg-config --static "$@"
-EOF
-chmod +x "$DEPS/pkg-config-static"
-export PKG_CONFIG="$DEPS/pkg-config-static"
 unset PKG_CONFIG_PATH
 unset PKG_CONFIG_LIBDIR
+
+# Ask the same question meson will ask, but now instead of twenty minutes from
+# now: pkg-config problems otherwise surface only when meson resolves libvips'
+# first dependency, as `Dependency "glib-2.0" not found, tried pkg-config`,
+# which says nothing about why.  $PKG_CONFIG is expanded unquoted here because
+# that is exactly how autoconf, meson and CMake each expand it.
+echo "pkg-config: PKG_CONFIG='${PKG_CONFIG}' ($($PKG_CONFIG --version 2>/dev/null || echo 'NOT RUNNABLE'))"
+for pc_name in glib-2.0 gio-2.0 gobject-2.0; do
+  if ! $PKG_CONFIG --exists "$pc_name"; then
+    echo "ERROR: PKG_CONFIG='${PKG_CONFIG}' cannot resolve ${pc_name}." >&2
+    $PKG_CONFIG --print-errors --exists "$pc_name" >&2 || true
+    exit 1
+  fi
+done
+echo "  static link line for glib-2.0: $($PKG_CONFIG --libs glib-2.0)"
+
+# The one thing a plain `pkgconf --exists` cannot prove is that *meson*, which
+# resolves PKG_CONFIG through Python rather than through a shell, can run it
+# too.  A two-second probe of a project that only asks for glib-2.0 and
+# gio-2.0 covers that, and it is the same call libvips' own meson.build makes.
+if command -v meson >/dev/null 2>&1; then
+  PKGCONFIG_PROBE="$DEPS/pkgconfig-probe"
+  rm -rf "$PKGCONFIG_PROBE"
+  mkdir -p "$PKGCONFIG_PROBE"
+  printf "project('pkgconfig-probe', 'c')\ndependency('glib-2.0')\ndependency('gio-2.0')\n" \
+    > "$PKGCONFIG_PROBE/meson.build"
+  if ! meson setup "${PKGCONFIG_PROBE}/_build" "$PKGCONFIG_PROBE" \
+       > "$DEPS/pkgconfig-probe.log" 2>&1; then
+    echo "ERROR: meson cannot resolve glib-2.0/gio-2.0 with PKG_CONFIG='${PKG_CONFIG}'." >&2
+    echo "       It looks for pkgconf.exe (or pkg-config.exe) on PATH and runs it" >&2
+    echo "       directly; a shell script it cannot exec is reported as 'not found'." >&2
+    tail -n 25 "$DEPS/pkgconfig-probe.log" >&2
+    exit 1
+  fi
+  PKGCONFIG_PROBE_LINE="$(grep -m1 'Found pkg-config' "$DEPS/pkgconfig-probe.log" || true)"
+  echo "  meson probe: ${PKGCONFIG_PROBE_LINE:-Found pkg-config: (line missing)}"
+  rm -rf "$PKGCONFIG_PROBE"
+fi
 
 # MSYS2's libspng ships its static archive as libspng_static.a, but libspng.pc asks
 # for -lspng - the import library that was just moved aside above (and which UCRT64
@@ -441,12 +495,19 @@ HEIF_DECODER_FLAG=OFF
 if [ "${HAVE_HEIF_DEC}" = 1 ]; then
   HEIF_DECODER_FLAG=ON
 fi
+# WITH_GDK_PIXBUF is libheif's loader plugin for the gdk-pixbuf framework, and
+# it is built whenever pkg-config can find gdk-pixbuf-2.0 - which happens in a
+# "full" build because librsvg pulls gdk-pixbuf2 in.  Nothing in libvips uses
+# that plugin, and here it cannot even link: CMake does not read $CPPFLAGS, so
+# the plugin is compiled with __declspec(dllimport) for GLib and asks for the
+# __imp_g_* thunks of the glib DLL whose import libraries were moved aside
+# above, while its link line has no -liconv for the static libintl.a.
 CFLAGS="${CFLAGS} ${DEP_CFLAGS} -DLIBDE265_STATIC_BUILD" CXXFLAGS="${CXXFLAGS} ${DEP_CXXFLAGS} -DLIBDE265_STATIC_BUILD" cmake -G"Unix Makefiles" \
   -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX_DIR" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=FALSE -DBUILD_DOCUMENTATION=0 -DBUILD_TESTING=0 -DENABLE_PLUGIN_LOADING=0 -DWITH_EXAMPLES=0 \
   -DWITH_AOM_DECODER=ON -DWITH_AOM_ENCODER=ON \
   -DWITH_LIBDE265=${HEIF_DECODER_FLAG} -DWITH_X265=${HEIF_ENCODER_FLAG} -DWITH_X264=OFF -DWITH_OpenH264_DECODER=OFF \
-  -DWITH_DAV1D=OFF -DWITH_SvtEnc=OFF -DWITH_RAV1E=OFF
+  -DWITH_DAV1D=OFF -DWITH_SvtEnc=OFF -DWITH_RAV1E=OFF -DWITH_GDK_PIXBUF=OFF
 make install/strip
 
 # matio (Matlab): its MSYS2 package links against shared-only hdf5, so build a
