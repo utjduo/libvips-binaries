@@ -112,9 +112,20 @@ CURL="curl --silent --location --retry 3 --retry-max-time 30"
 source "${PACKAGE}/build-scripts/codecs.sh"
 echo "libvips codec flags:${VIPS_CODEC_FLAGS}"
 
+# PRESET (and its numeric alias LEAN) trims the heavyweight optional features
+# (svgload, textload, UltraHDR, dzsave, the quantiser, TIFF, the HEVC encoder).
+# HAVE_* / NEED_VECTOR_TEXT tell the dependency builders below whether a library
+# is worth downloading and building at all - libvips would not link it either
+# way, but building it costs several minutes.
+NEED_VECTOR_TEXT=0
+if [ "${HAVE_SVG}" = 1 ] || [ "${HAVE_TEXT_STACK}" = 1 ]; then
+  NEED_VECTOR_TEXT=1
+fi
+
 # Download and build dependencies from source
 
-if [ "$DARWIN" = true ]; then
+if [ "$DARWIN" = true ] && [ "${HAVE_SVG}" = 1 ]; then
+  # Rust + cargo-c are only here to build librsvg; a trimmed build does not need them.
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --profile minimal --default-toolchain nightly
   export RUSTFLAGS+=" -Zlocation-detail=none -Zfmt-debug=none"
@@ -163,20 +174,24 @@ meson setup _build --default-library=static --buildtype=release --strip --prefix
   -Dminimum=true
 meson install -C _build --tag devel
 
-mkdir ${DEPS}/exif
-$CURL https://github.com/libexif/libexif/releases/download/v${VERSION_EXIF}/libexif-${VERSION_EXIF}.tar.xz | tar xJC ${DEPS}/exif --strip-components=1
-cd ${DEPS}/exif
-./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
-  --disable-nls --disable-docs --without-libiconv-prefix --without-libintl-prefix \
-  CPPFLAGS="${CPPFLAGS} -DNO_VERBOSE_TAG_DATA"
-make install-strip doc_DATA=
+if [ "${HAVE_EXIF}" = 1 ]; then
+  mkdir ${DEPS}/exif
+  $CURL https://github.com/libexif/libexif/releases/download/v${VERSION_EXIF}/libexif-${VERSION_EXIF}.tar.xz | tar xJC ${DEPS}/exif --strip-components=1
+  cd ${DEPS}/exif
+  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
+    --disable-nls --disable-docs --without-libiconv-prefix --without-libintl-prefix \
+    CPPFLAGS="${CPPFLAGS} -DNO_VERBOSE_TAG_DATA"
+  make install-strip doc_DATA=
+fi
 
-mkdir ${DEPS}/lcms
-$CURL https://github.com/mm2/Little-CMS/releases/download/lcms${VERSION_LCMS}/lcms2-${VERSION_LCMS}.tar.gz | tar xzC ${DEPS}/lcms --strip-components=1
-cd ${DEPS}/lcms
-CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  -Dtests=disabled
-meson install -C _build --tag devel
+if [ "${HAVE_LCMS}" = 1 ]; then
+  mkdir ${DEPS}/lcms
+  $CURL https://github.com/mm2/Little-CMS/releases/download/lcms${VERSION_LCMS}/lcms2-${VERSION_LCMS}.tar.gz | tar xzC ${DEPS}/lcms --strip-components=1
+  cd ${DEPS}/lcms
+  CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    -Dtests=disabled
+  meson install -C _build --tag devel
+fi
 
 mkdir ${DEPS}/aom
 $CURL https://storage.googleapis.com/aom-releases/libaom-${VERSION_AOM}.tar.gz | tar xzC ${DEPS}/aom --strip-components=1
@@ -191,12 +206,46 @@ AOM_AS_FLAGS="${FLAGS}" cmake -G"Unix Makefiles" \
   ..
 make install/strip
 
+# HEVC needs two plugins in libheif: libde265 decodes, x265 encodes. Without
+# libde265 libheif still registers heifload, so AVIF works, but reading a real
+# .heic fails with "Unsupported compression" - indistinguishable from a broken
+# build - so the decoder stays on in every preset. x265 is ~21 MB and GPL, so
+# only the "full" preset builds it (FEATURES=heif_enc=on brings it back).
+HEIF_DECODER=0
+if [ "${HAVE_HEIF_DEC}" = 1 ]; then
+  mkdir ${DEPS}/de265
+  $CURL https://github.com/strukturag/libde265/releases/download/v${VERSION_DE265}/libde265-${VERSION_DE265}.tar.gz | tar xzC ${DEPS}/de265 --strip-components=1
+  if ( cd ${DEPS}/de265 && cmake -G"Unix Makefiles" \
+      -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=MinSizeRel \
+      -DBUILD_SHARED_LIBS=FALSE -DENABLE_DECODER=0 -DENABLE_ENCODER=0 -DENABLE_SHERLOCK265=0 -DENABLE_INTERNAL_DEVELOPMENT_TOOLS=0 \
+      -DENABLE_SDL=0 -DWITH_FUZZERS=0 ${WITHOUT_NEON:+-DENABLE_SIMD=0} . && \
+      make install/strip ); then
+    HEIF_DECODER=1
+  else
+    echo "Warning: libde265 ${VERSION_DE265} failed to build; .heic/.h265 files will not load" >&2
+    FEATURES="$(printf '%s' "${FEATURES}" | sed 's/heif_dec=on/heif_dec=off/')"
+  fi
+fi
+HEIF_ENCODER=0
+if [ "${HAVE_HEIF_ENC}" = 1 ]; then
+  # x265 is never built from source here: it is a large GPL-2.0-or-later C++
+  # library and only the untrimmed "full" preset asks for it. Use the one the
+  # image already provides when there is one, and say so when there is not,
+  # rather than letting libheif's configure step fail on a missing dependency.
+  if $PKG_CONFIG --exists x265 2>/dev/null; then
+    HEIF_ENCODER=1
+  else
+    echo "Warning: x265 is not available on this build host; .heic/.h265 cannot be written" >&2
+    FEATURES="$(printf '%s' "${FEATURES}" | sed 's/heif_enc=on/heif_enc=off/')"
+  fi
+fi
+
 mkdir ${DEPS}/heif
 $CURL https://github.com/strukturag/libheif/archive/${VERSION_HEIF}.tar.gz | tar xzC ${DEPS}/heif --strip-components=1
 cd ${DEPS}/heif
 CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
   -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_SHARED_LIBS=FALSE -DBUILD_DOCUMENTATION=0 -DBUILD_TESTING=0 -DENABLE_PLUGIN_LOADING=0 -DWITH_EXAMPLES=0 -DWITH_LIBDE265=0 -DWITH_X265=0
+  -DBUILD_SHARED_LIBS=FALSE -DBUILD_DOCUMENTATION=0 -DBUILD_TESTING=0 -DENABLE_PLUGIN_LOADING=0 -DWITH_EXAMPLES=0 -DWITH_LIBDE265=${HEIF_DECODER} -DWITH_X265=${HEIF_ENCODER}
 make install/strip
 
 mkdir ${DEPS}/jpeg
@@ -218,11 +267,13 @@ cd ${DEPS}/png
   --disable-tools --without-binconfigs --disable-unversioned-libpng-config
 make install-strip dist_man_MANS=
 
-mkdir ${DEPS}/imagequant
-$CURL https://github.com/lovell/libimagequant/archive/v${VERSION_IMAGEQUANT}.tar.gz | tar xzC ${DEPS}/imagequant --strip-components=1
-cd ${DEPS}/imagequant
-CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON}
-meson install -C _build --tag devel
+if [ "${HAVE_IMAGEQUANT}" = 1 ]; then
+  mkdir ${DEPS}/imagequant
+  $CURL https://github.com/lovell/libimagequant/archive/v${VERSION_IMAGEQUANT}.tar.gz | tar xzC ${DEPS}/imagequant --strip-components=1
+  cd ${DEPS}/imagequant
+  CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON}
+  meson install -C _build --tag devel
+fi
 
 mkdir ${DEPS}/webp
 $CURL https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${VERSION_WEBP}.tar.gz | tar xzC ${DEPS}/webp --strip-components=1
@@ -231,15 +282,17 @@ cd ${DEPS}/webp
   --enable-libwebpmux --enable-libwebpdemux ${WITHOUT_NEON:+--disable-neon}
 make install-strip bin_PROGRAMS= noinst_PROGRAMS= man_MANS=
 
-mkdir ${DEPS}/tiff
-$CURL https://gitlab.com/libtiff/libtiff/-/archive/${VERSION_TIFF}/libtiff-${VERSION_TIFF}.tar.gz | tar xzC ${DEPS}/tiff --strip-components=1
-cd ${DEPS}/tiff
-cmake -G"Unix Makefiles" \
-  -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=MinSizeRel \
-  -DBUILD_SHARED_LIBS=FALSE -DCMath_HAVE_LIBC_POW=1 \
-  -Dtiff-contrib=OFF -Dtiff-cxx=OFF -Dtiff-docs=OFF -Dtiff-tests=OFF -Dtiff-tools=OFF -Dmdi=OFF \
-  -Djbig=OFF -Dlerc=OFF -Dlibdeflate=OFF -Dlzma=OFF -Dold-jpeg=OFF -Dpixarlog=OFF -Dtiff-opengl=OFF -Dzstd=OFF
-make install/strip
+if [ "${HAVE_TIFF}" = 1 ]; then
+  mkdir ${DEPS}/tiff
+  $CURL https://gitlab.com/libtiff/libtiff/-/archive/${VERSION_TIFF}/libtiff-${VERSION_TIFF}.tar.gz | tar xzC ${DEPS}/tiff --strip-components=1
+  cd ${DEPS}/tiff
+  cmake -G"Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=MinSizeRel \
+    -DBUILD_SHARED_LIBS=FALSE -DCMath_HAVE_LIBC_POW=1 \
+    -Dtiff-contrib=OFF -Dtiff-cxx=OFF -Dtiff-docs=OFF -Dtiff-tests=OFF -Dtiff-tools=OFF -Dmdi=OFF \
+    -Djbig=OFF -Dlerc=OFF -Dlibdeflate=OFF -Dlzma=OFF -Dold-jpeg=OFF -Dpixarlog=OFF -Dtiff-opengl=OFF -Dzstd=OFF
+  make install/strip
+fi
 
 if [ -z "$WITHOUT_HIGHWAY" ] || codec_on jpeg-xl; then
   mkdir ${DEPS}/highway
@@ -260,96 +313,108 @@ build_freetype() {
     -Dzlib=enabled -Dpng=enabled -Dbrotli=disabled -Dbzip2=disabled "$@"
   meson install -C _build --tag devel
 }
-build_freetype -Dharfbuzz=disabled
+# freetype, expat (via fontconfig), fontconfig, harfbuzz, graphite2, pixman and
+# cairo exist only to serve svgload and textload; skip them when both are trimmed.
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then
+  build_freetype -Dharfbuzz=disabled
 
-mkdir ${DEPS}/expat
-$CURL https://github.com/libexpat/libexpat/releases/download/R_${VERSION_EXPAT//./_}/expat-${VERSION_EXPAT}.tar.xz | tar xJC ${DEPS}/expat --strip-components=1
-cd ${DEPS}/expat
-./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared \
-  --disable-dependency-tracking --without-xmlwf --without-docbook --without-getrandom --without-sys-getrandom \
-  --without-libbsd --without-examples --without-tests
-make install-strip dist_cmake_DATA= nodist_cmake_DATA=
+  mkdir ${DEPS}/expat
+  $CURL https://github.com/libexpat/libexpat/releases/download/R_${VERSION_EXPAT//./_}/expat-${VERSION_EXPAT}.tar.xz | tar xJC ${DEPS}/expat --strip-components=1
+  cd ${DEPS}/expat
+  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared \
+    --disable-dependency-tracking --without-xmlwf --without-docbook --without-getrandom --without-sys-getrandom \
+    --without-libbsd --without-examples --without-tests
+  make install-strip dist_cmake_DATA= nodist_cmake_DATA=
+fi
 
-mkdir ${DEPS}/archive
-$CURL https://github.com/libarchive/libarchive/releases/download/v${VERSION_ARCHIVE}/libarchive-${VERSION_ARCHIVE}.tar.xz | tar xJC ${DEPS}/archive --strip-components=1
-cd ${DEPS}/archive
-./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
-  --disable-bsdtar --disable-bsdcat --disable-bsdcpio --disable-bsdunzip --disable-posix-regex-lib --disable-xattr --disable-acl \
-  --without-bz2lib --without-libb2 --without-iconv --without-lz4 --without-zstd --without-lzma \
-  --without-lzo2 --without-cng --without-openssl --without-xml2 --without-expat
-make install-strip libarchive_man_MANS=
+if [ "${HAVE_DZSAVE}" = 1 ]; then
+  mkdir ${DEPS}/archive
+  $CURL https://github.com/libarchive/libarchive/releases/download/v${VERSION_ARCHIVE}/libarchive-${VERSION_ARCHIVE}.tar.xz | tar xJC ${DEPS}/archive --strip-components=1
+  cd ${DEPS}/archive
+  ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
+    --disable-bsdtar --disable-bsdcat --disable-bsdcpio --disable-bsdunzip --disable-posix-regex-lib --disable-xattr --disable-acl \
+    --without-bz2lib --without-libb2 --without-iconv --without-lz4 --without-zstd --without-lzma \
+    --without-lzo2 --without-cng --without-openssl --without-xml2 --without-expat
+  make install-strip libarchive_man_MANS=
+fi
 
-mkdir ${DEPS}/fontconfig
-$CURL https://gitlab.freedesktop.org/fontconfig/fontconfig/-/archive/${VERSION_FONTCONFIG}/fontconfig-${VERSION_FONTCONFIG}.tar.gz | tar xzC ${DEPS}/fontconfig --strip-components=1
-cd ${DEPS}/fontconfig
-# Disable install of gettext files
-sed -i'.bak' "/subdir('its')/d" meson.build
-# Silence FcInit warnings
-sed -i'.bak' "/using without calling FcInit/d" src/fcobjs.c
-meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  -Dcache-build=disabled -Ddoc=disabled -Dnls=disabled -Dtests=disabled -Dtools=disabled
-meson install -C _build --tag devel
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then
+  mkdir ${DEPS}/fontconfig
+  $CURL https://gitlab.freedesktop.org/fontconfig/fontconfig/-/archive/${VERSION_FONTCONFIG}/fontconfig-${VERSION_FONTCONFIG}.tar.gz | tar xzC ${DEPS}/fontconfig --strip-components=1
+  cd ${DEPS}/fontconfig
+  # Disable install of gettext files
+  sed -i'.bak' "/subdir('its')/d" meson.build
+  # Silence FcInit warnings
+  sed -i'.bak' "/using without calling FcInit/d" src/fcobjs.c
+  meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    -Dcache-build=disabled -Ddoc=disabled -Dnls=disabled -Dtests=disabled -Dtools=disabled
+  meson install -C _build --tag devel
 
-mkdir ${DEPS}/harfbuzz
-$CURL https://github.com/harfbuzz/harfbuzz/archive/${VERSION_HARFBUZZ}.tar.gz | tar xzC ${DEPS}/harfbuzz --strip-components=1
-cd ${DEPS}/harfbuzz
-meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  -Dgobject=disabled -Dicu=disabled -Dtests=disabled -Dintrospection=disabled -Ddocs=disabled -Dbenchmark=disabled -Dutilities=disabled \
-  -Draster=disabled -Dvector=disabled -Dsubset=disabled -Dgpu=disabled -Dgpu_demo=disabled \
-  ${DARWIN:+-Dcoretext=enabled}
-meson install -C _build --tag devel
+  mkdir ${DEPS}/harfbuzz
+  $CURL https://github.com/harfbuzz/harfbuzz/archive/${VERSION_HARFBUZZ}.tar.gz | tar xzC ${DEPS}/harfbuzz --strip-components=1
+  cd ${DEPS}/harfbuzz
+  meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    -Dgobject=disabled -Dicu=disabled -Dtests=disabled -Dintrospection=disabled -Ddocs=disabled -Dbenchmark=disabled -Dutilities=disabled \
+    -Draster=disabled -Dvector=disabled -Dsubset=disabled -Dgpu=disabled -Dgpu_demo=disabled \
+    ${DARWIN:+-Dcoretext=enabled}
+  meson install -C _build --tag devel
 
-build_freetype -Dharfbuzz=enabled
+  build_freetype -Dharfbuzz=enabled
 
-mkdir ${DEPS}/pixman
-$CURL https://cairographics.org/releases/pixman-${VERSION_PIXMAN}.tar.gz | tar xzC ${DEPS}/pixman --strip-components=1
-cd ${DEPS}/pixman
-meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  -Dlibpng=disabled -Dgtk=disabled -Dopenmp=disabled -Dtests=disabled -Ddemos=disabled \
-  ${WITHOUT_NEON:+-Da64-neon=disabled}
-meson install -C _build --tag devel
+  mkdir ${DEPS}/pixman
+  $CURL https://cairographics.org/releases/pixman-${VERSION_PIXMAN}.tar.gz | tar xzC ${DEPS}/pixman --strip-components=1
+  cd ${DEPS}/pixman
+  meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    -Dlibpng=disabled -Dgtk=disabled -Dopenmp=disabled -Dtests=disabled -Ddemos=disabled \
+    ${WITHOUT_NEON:+-Da64-neon=disabled}
+  meson install -C _build --tag devel
 
-mkdir ${DEPS}/cairo
-$CURL https://cairographics.org/releases/cairo-${VERSION_CAIRO}.tar.xz | tar xJC ${DEPS}/cairo --strip-components=1
-cd ${DEPS}/cairo
-meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  ${LINUX:+-Dquartz=disabled} ${DARWIN:+-Dquartz=enabled} -Dfreetype=enabled -Dfontconfig=enabled -Dtee=disabled -Dxcb=disabled -Dxlib=disabled -Dzlib=disabled \
-  -Dtests=disabled -Dspectre=disabled -Dsymbol-lookup=disabled
-meson install -C _build --tag devel
+  mkdir ${DEPS}/cairo
+  $CURL https://cairographics.org/releases/cairo-${VERSION_CAIRO}.tar.xz | tar xJC ${DEPS}/cairo --strip-components=1
+  cd ${DEPS}/cairo
+  meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    ${LINUX:+-Dquartz=disabled} ${DARWIN:+-Dquartz=enabled} -Dfreetype=enabled -Dfontconfig=enabled -Dtee=disabled -Dxcb=disabled -Dxlib=disabled -Dzlib=disabled \
+    -Dtests=disabled -Dspectre=disabled -Dsymbol-lookup=disabled
+  meson install -C _build --tag devel
+fi
 
-mkdir ${DEPS}/fribidi
-$CURL https://github.com/fribidi/fribidi/releases/download/v${VERSION_FRIBIDI}/fribidi-${VERSION_FRIBIDI}.tar.xz | tar xJC ${DEPS}/fribidi --strip-components=1
-cd ${DEPS}/fribidi
-meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  -Ddocs=false -Dbin=false -Dtests=false
-meson install -C _build --tag devel
+if [ "${HAVE_TEXT_STACK}" = 1 ]; then
+  mkdir ${DEPS}/fribidi
+  $CURL https://github.com/fribidi/fribidi/releases/download/v${VERSION_FRIBIDI}/fribidi-${VERSION_FRIBIDI}.tar.xz | tar xJC ${DEPS}/fribidi --strip-components=1
+  cd ${DEPS}/fribidi
+  meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    -Ddocs=false -Dbin=false -Dtests=false
+  meson install -C _build --tag devel
 
-mkdir ${DEPS}/pango
-$CURL https://download.gnome.org/sources/pango/$(without_patch $VERSION_PANGO)/pango-${VERSION_PANGO}.tar.xz | tar xJC ${DEPS}/pango --strip-components=1
-cd ${DEPS}/pango
-# Disable utils and tools
-sed -i'.bak' "/subdir('utils')/{N;d;}" meson.build
-meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
-  -Ddocumentation=false -Dbuild-testsuite=false -Dbuild-examples=false -Dintrospection=disabled -Dfontconfig=enabled
-meson install -C _build --tag devel
+  mkdir ${DEPS}/pango
+  $CURL https://download.gnome.org/sources/pango/$(without_patch $VERSION_PANGO)/pango-${VERSION_PANGO}.tar.xz | tar xJC ${DEPS}/pango --strip-components=1
+  cd ${DEPS}/pango
+  # Disable utils and tools
+  sed -i'.bak' "/subdir('utils')/{N;d;}" meson.build
+  meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
+    -Ddocumentation=false -Dbuild-testsuite=false -Dbuild-examples=false -Dintrospection=disabled -Dfontconfig=enabled
+  meson install -C _build --tag devel
+fi
 
-mkdir ${DEPS}/rsvg
-$CURL https://download.gnome.org/sources/librsvg/$(without_patch $VERSION_RSVG)/librsvg-${VERSION_RSVG}.tar.xz | tar xJC ${DEPS}/rsvg --strip-components=1
-cd ${DEPS}/rsvg
-# Disallow GIF and WebP embedded in SVG images
-sed -i'.bak' "/image = /s/, \"gif\", \"webp\"//" rsvg/Cargo.toml
-# We build Cairo with `-Dzlib=disabled`, which implicitly disables the PDF/PostScript surface backends
-sed -i'.bak' "/cairo-rs = /s/, \"pdf\", \"ps\"//" {librsvg-c,rsvg}/Cargo.toml
-# https://gitlab.gnome.org/GNOME/librsvg/-/merge_requests/1066#note_2356762
-sed -i'.bak' "/^if host_system in \['windows'/s/, 'linux'//" meson.build
-# Regenerate the lockfile after making the above changes
-cargo update --workspace
-# Remove the --static flag from the PKG_CONFIG env since Rust does not
-# parse that correctly.
-PKG_CONFIG=${PKG_CONFIG/ --static/} meson setup _build --default-library=static --buildtype=plain --strip --prefix=${TARGET} ${MESON} \
-  -Dintrospection=disabled -Dpixbuf{,-loader}=disabled -Drsvg-convert=disabled -Ddocs=disabled -Dvala=disabled -Dtests=false \
-  ${RUST_TARGET:+-Dtriplet=$RUST_TARGET}
-meson install -C _build --tag devel
+if [ "${HAVE_SVG}" = 1 ]; then
+  mkdir ${DEPS}/rsvg
+  $CURL https://download.gnome.org/sources/librsvg/$(without_patch $VERSION_RSVG)/librsvg-${VERSION_RSVG}.tar.xz | tar xJC ${DEPS}/rsvg --strip-components=1
+  cd ${DEPS}/rsvg
+  # Disallow GIF and WebP embedded in SVG images
+  sed -i'.bak' "/image = /s/, \"gif\", \"webp\"//" rsvg/Cargo.toml
+  # We build Cairo with `-Dzlib=disabled`, which implicitly disables the PDF/PostScript surface backends
+  sed -i'.bak' "/cairo-rs = /s/, \"pdf\", \"ps\"//" {librsvg-c,rsvg}/Cargo.toml
+  # https://gitlab.gnome.org/GNOME/librsvg/-/merge_requests/1066#note_2356762
+  sed -i'.bak' "/^if host_system in \['windows'/s/, 'linux'//" meson.build
+  # Regenerate the lockfile after making the above changes
+  cargo update --workspace
+  # Remove the --static flag from the PKG_CONFIG env since Rust does not
+  # parse that correctly.
+  PKG_CONFIG=${PKG_CONFIG/ --static/} meson setup _build --default-library=static --buildtype=plain --strip --prefix=${TARGET} ${MESON} \
+    -Dintrospection=disabled -Dpixbuf{,-loader}=disabled -Drsvg-convert=disabled -Ddocs=disabled -Dvala=disabled -Dtests=false \
+    ${RUST_TARGET:+-Dtriplet=$RUST_TARGET}
+  meson install -C _build --tag devel
+fi
 
 mkdir ${DEPS}/cgif
 $CURL https://github.com/dloebl/cgif/archive/v${VERSION_CGIF}.tar.gz | tar xzC ${DEPS}/cgif --strip-components=1
@@ -358,17 +423,19 @@ CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=r
   -Dexamples=false -Dtests=false
 meson install -C _build --tag devel
 
-mkdir ${DEPS}/uhdr
-$CURL https://github.com/google/libultrahdr/archive/${VERSION_UHDR}.tar.gz | tar xzC ${DEPS}/uhdr --strip-components=1
-cd ${DEPS}/uhdr
-# [PATCH] Remove platform and architecture detection logic
-$CURL https://patch-diff.githubusercontent.com/raw/google/libultrahdr/pull/383.patch | patch -p1
-# Ensure install targets are enabled when cross-compiling
-sed -i'.bak' 's/CMAKE_CROSSCOMPILING AND UHDR_ENABLE_INSTALL/FALSE/' CMakeLists.txt
-CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
-  -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_SHARED_LIBS=FALSE -DUHDR_BUILD_EXAMPLES=FALSE -DUHDR_MAX_DIMENSION=65500 ${WITHOUT_NEON:+-DUHDR_ENABLE_INTRINSICS=FALSE}
-make install/strip
+if [ "${HAVE_UHDR}" = 1 ]; then
+  mkdir ${DEPS}/uhdr
+  $CURL https://github.com/google/libultrahdr/archive/${VERSION_UHDR}.tar.gz | tar xzC ${DEPS}/uhdr --strip-components=1
+  cd ${DEPS}/uhdr
+  # [PATCH] Remove platform and architecture detection logic
+  $CURL https://patch-diff.githubusercontent.com/raw/google/libultrahdr/pull/383.patch | patch -p1
+  # Ensure install targets are enabled when cross-compiling
+  sed -i'.bak' 's/CMAKE_CROSSCOMPILING AND UHDR_ENABLE_INSTALL/FALSE/' CMakeLists.txt
+  CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
+    -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=FALSE -DUHDR_BUILD_EXAMPLES=FALSE -DUHDR_MAX_DIMENSION=65500 ${WITHOUT_NEON:+-DUHDR_ENABLE_INTRINSICS=FALSE}
+  make install/strip
+fi
 
 # ---------------------------------------------------------------------------
 # Optional codec dependencies (only built when selected via CODECS)
@@ -490,8 +557,27 @@ $CURL https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips
 cd ${DEPS}/vips
 # Use version number in SONAME
 $CURL https://gist.githubusercontent.com/lovell/313a6901e9db1bf285f2a1f1180499e4/raw/3988223c7dfa4d22745d9392034b0117abef1446/libvips-cpp-soversion.patch | patch -p1
-# Disable HBR support in heifsave
-$CURL https://raw.githubusercontent.com/libvips/build-win64-mxe/v${VERSION_VIPS}/build/patches/vips-8-heifsave-disable-hbr-support.patch | patch -p1
+# Disable HBR support in heifsave.
+#
+# Same story as build-scripts/win.sh: libvips/build-win64-mxe removed this patch from
+# its release tags (2026-06-06, "aom: enable HDR support") and libvips >= 8.18 has no
+# HBR code left in heifsave.c. Fetch with --fail so a 404 page cannot be piped into
+# patch as garbage input, and treat a patch that cannot be applied as a warning.
+apply_vips_heifsave_hbr_patch() {
+  local patch_url="https://raw.githubusercontent.com/libvips/build-win64-mxe/v${VERSION_VIPS}/build/patches/vips-8-heifsave-disable-hbr-support.patch"
+  local patch_file="${DEPS}/vips-heifsave-hbr.patch"
+  if ! $CURL --fail -o "$patch_file" "$patch_url" 2>/dev/null; then
+    echo "heifsave HBR patch is not published for vips ${VERSION_VIPS}; nothing to patch"
+    return 0
+  fi
+  if patch -N -p1 -i "$patch_file"; then
+    echo "Applied heifsave HBR patch"
+  else
+    echo "Warning: heifsave HBR patch does not apply to vips ${VERSION_VIPS}; skipping" >&2
+  fi
+  rm -f "$patch_file"
+}
+apply_vips_heifsave_hbr_patch
 # Link libvips.so statically into libvips-cpp.so
 sed -i'.bak' "s/library('vips'/static_&/" libvips/meson.build
 sed -i'.bak' "/version: library_version/{N;d;}" libvips/meson.build
@@ -505,12 +591,45 @@ if [ "$LINUX" = true ]; then
 fi
 # Disable building man pages, gettext po files, tools, and (fuzz-)tests
 sed -i'.bak' "/subdir('man')/{N;N;N;N;d;}" meson.build
+# libvips links a single PNG backend: meson only looks for spng when libpng was not
+# found, and libpng is always built here, so selecting the "spng" codec has to
+# switch libvips over to it explicitly or the selection is silently ignored.
+PNG_BACKEND_FLAGS=""
+if codec_on spng; then
+  # -Dspng=enabled already comes from build-scripts/codecs.sh for the posix build,
+  # so only the libpng side has to be switched off here.
+  PNG_BACKEND_FLAGS="-Dpng=disabled"
+  echo "PNG backend: libspng (libpng is disabled for this build - libvips links one PNG backend at a time)"
+  echo "Note: with the libspng backend libvips does not export the convenience wrappers" \
+    "vips_pngload()/vips_pngsave(); the \"pngload\"/\"pngsave\" operations and the C++" \
+    "vips::VImage::pngsave() still work, as do vips_image_new_from_file() and" \
+    "vips_image_write_to_file(). See build-scripts/smoke-test.sh." >&2
+fi
 CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" meson setup _build --default-library=shared --buildtype=release --strip --prefix=${TARGET} ${MESON} \
   -Ddeprecated=false -Dexamples=false -Dauto_features=enabled -Dintrospection=disabled -Dmodules=disabled \
   ${WITHOUT_HIGHWAY:+-Dhighway=disabled} \
-  ${VIPS_CODEC_FLAGS} \
+  ${VIPS_CODEC_FLAGS} ${PNG_BACKEND_FLAGS} \
   ${LINUX:+-Dcpp_link_args="$LDFLAGS -Wl,-Bsymbolic-functions -Wl,--version-script=$DEPS/vips/vips.map $EXCLUDE_LIBS"}
 meson install -C _build --tag runtime,devel
+
+# ---------------------------------------------------------------------------
+# Smoke test: compile and run build-scripts/smoke-test.c against the library that
+# was just installed into $TARGET, so a broken link, a missing dependency or an
+# unexpected trim is caught here rather than by whoever downloads the artifact.
+# It runs before the cleanup below because that deletes $TARGET/lib/pkgconfig, the
+# only place vips.pc is guaranteed to exist; the filtering step after it only moves
+# and renames the libraries that have already been linked and run here. TARGET is
+# passed explicitly because posix builds keep it outside the package tree. Formats
+# LEAN removed on purpose are reported as trimmed instead of failing the build.
+# Set SMOKE_TEST=0 to skip the test.
+# ---------------------------------------------------------------------------
+if [ "${SMOKE_TEST:-1}" != 0 ]; then
+  echo "Smoke testing the library installed in $TARGET..."
+  if ! TARGET="$TARGET" bash "${PACKAGE}/build-scripts/smoke-test.sh" ${CODECS}; then
+    echo "ERROR: the smoke test failed - the library in $TARGET is not usable." >&2
+    exit 1
+  fi
+fi
 
 # Cleanup
 rm -rf ${TARGET}/lib/{pkgconfig,.libs,*.la,cmake}
@@ -579,30 +698,38 @@ add_version() {
   VERSIONS_SEP=",
 "
 }
+# "preset"/"lean"/"features" record how this package was trimmed, so a consumer -
+# and build-scripts/smoke-test.sh - can tell which formats are missing on purpose.
+# See the feature-trimming block in build-scripts/codecs.sh.
+add_version preset "${PRESET}"
+add_version lean "${LEAN}"
+add_version features "${FEATURES}"
 add_version aom "${VERSION_AOM}"
-add_version archive "${VERSION_ARCHIVE}"
-add_version cairo "${VERSION_CAIRO}"
+if [ "${HAVE_DZSAVE}" = 1 ]; then add_version archive "${VERSION_ARCHIVE}"; fi
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version cairo "${VERSION_CAIRO}"; fi
 add_version cgif "${VERSION_CGIF}"
-add_version exif "${VERSION_EXIF}"
-add_version expat "${VERSION_EXPAT}"
+if [ "${HAVE_EXIF}" = 1 ]; then add_version exif "${VERSION_EXIF}"; fi
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version expat "${VERSION_EXPAT}"; fi
 add_version ffi "${VERSION_FFI}"
-add_version fontconfig "${VERSION_FONTCONFIG}"
-add_version freetype "${VERSION_FREETYPE}"
-add_version fribidi "${VERSION_FRIBIDI}"
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version fontconfig "${VERSION_FONTCONFIG}"; fi
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version freetype "${VERSION_FREETYPE}"; fi
+if [ "${HAVE_TEXT_STACK}" = 1 ]; then add_version fribidi "${VERSION_FRIBIDI}"; fi
 add_version glib "${VERSION_GLIB}"
-add_version harfbuzz "${VERSION_HARFBUZZ}"
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version harfbuzz "${VERSION_HARFBUZZ}"; fi
 add_version heif "${VERSION_HEIF}"
+if [ "${HEIF_DECODER}" = 1 ]; then add_version de265 "${VERSION_DE265}"; fi
+if [ "${HEIF_ENCODER}" = 1 ]; then add_version x265 "system"; fi
 add_version highway "${VERSION_HIGHWAY}"
-add_version imagequant "${VERSION_IMAGEQUANT}"
-add_version lcms "${VERSION_LCMS}"
+if [ "${HAVE_IMAGEQUANT}" = 1 ]; then add_version imagequant "${VERSION_IMAGEQUANT}"; fi
+if [ "${HAVE_LCMS}" = 1 ]; then add_version lcms "${VERSION_LCMS}"; fi
 add_version mozjpeg "${VERSION_MOZJPEG}"
-add_version pango "${VERSION_PANGO}"
-add_version pixman "${VERSION_PIXMAN}"
+if [ "${HAVE_TEXT_STACK}" = 1 ]; then add_version pango "${VERSION_PANGO}"; fi
+if [ "${NEED_VECTOR_TEXT}" = 1 ]; then add_version pixman "${VERSION_PIXMAN}"; fi
 add_version png "${VERSION_PNG}"
 add_version proxy-libintl "${VERSION_PROXY_LIBINTL}"
-add_version rsvg "${VERSION_RSVG}"
-add_version tiff "${VERSION_TIFF}"
-add_version uhdr "${VERSION_UHDR}"
+if [ "${HAVE_SVG}" = 1 ]; then add_version rsvg "${VERSION_RSVG}"; fi
+if [ "${HAVE_TIFF}" = 1 ]; then add_version tiff "${VERSION_TIFF}"; fi
+if [ "${HAVE_UHDR}" = 1 ]; then add_version uhdr "${VERSION_UHDR}"; fi
 add_version vips "${VERSION_VIPS}"
 add_version webp "${VERSION_WEBP}"
 add_version xml2 "${VERSION_XML2}"
@@ -643,6 +770,7 @@ $CURL -O https://raw.githubusercontent.com/CodeWithKyrian/libvips-binaries/main/
 ls -al lib
 rm -rf lib
 mv lib-filtered lib
+
 tar chzf ${PACKAGE}/libvips-${PLATFORM}.tar.gz \
   include \
   lib \

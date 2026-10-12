@@ -17,7 +17,8 @@
 #   ./build-selectable.sh -c all                     # all codecs, host platforms
 #   ./build-selectable.sh -c jpeg-xl,openjpeg,ppm    # explicit codec list
 #   ./build-selectable.sh -c none                    # core codecs only
-#   ./build-selectable.sh -p linux-x64 -c exr --yes  # unattended
+#   ./build-selectable.sh -p linux-x64 --preset image --yes
+#   ./build-selectable.sh --preset aggressive --features heif_enc=on,imagequant=on
 #   ./build-selectable.sh --dry-run                  # show commands, build nothing
 #
 # build.sh / build-scripts/posix.sh are derived from the build scripts of
@@ -84,7 +85,7 @@ DEFAULT_CODECS="nsgif qoi"
 
 codec_desc() {
   case "$1" in
-    spng)     echo 'PNG via libspng' ;;
+    spng)     echo 'PNG via libspng (replaces the libpng backend)' ;;
     openjpeg) echo 'JPEG 2000 (jp2)' ;;
     openexr)  echo 'OpenEXR (exr), also builds Imath' ;;
     jpeg-xl)  echo 'JPEG XL (jxl), also builds brotli + highway' ;;
@@ -285,6 +286,25 @@ Anything that is not given as an option is asked for interactively.
                           Linux: linux-x64 linux-arm64, Windows: win-x64)
   -c, --codecs LIST       Optional codecs: comma separated, or 'all',
                           'default' (nsgif,qoi) or 'none'
+      --preset NAME       How much of libvips to build:
+                          full        everything (largest output)
+                          lean        no svgload, no textload, no UltraHDR and no
+                                      HEVC encode (x265); AVIF encode/decode and
+                                      HEIC decode are kept (the default when run
+                                      interactively)
+                          aggressive  as lean, plus no TIFF and no dzsave
+                          image       as aggressive, but keeps the quantiser so
+                                      GIF saving works: the preset for image-only
+                                      pipelines
+                          'full', 'lean' and 'aggressive' are also accepted as
+                          0, 1 and 2, and --lean LEVEL still works as an alias.
+                          Without either option the PRESET (or LEAN) environment
+                          variable is used, defaulting to 'lean' when asked
+                          interactively and 'full' when run unattended.
+      --features LIST     Switch single features on top of the preset, as
+                          name=on|off pairs: svgload, textload, uhdr, tiffload,
+                          dzsave, imagequant, exif, lcms, heif_dec, heif_enc.
+                          Example: --preset aggressive --features heif_enc=on
   -v, --version VERSION   libvips version to build. Default: VERSION_VIPS in
                           versions.properties (it is rewritten when changed)
   -y, --yes               Unattended: ask nothing, use defaults for anything
@@ -297,12 +317,17 @@ Anything that is not given as an option is asked for interactively.
       --list-platforms    Print the platforms buildable here and exit
   -h, --help              Show this help
 
-Core codecs (jpeg, png, webp, tiff, heif/avif, uhdr, gif, svg, exif, lcms,
-imagequant, archive, highway, text) are always built and cannot be turned off.
+jpeg, png, webp, gif loading, magick load (for svg), heif/avif and lcms are
+always built. tiff, dzsave, svgload, textload, UltraHDR, the GIF quantiser,
+exif and the HEVC encoder follow the preset and can be switched individually
+with --features.
 USAGE
 }
 
 CODECS_OPT=''
+PRESET_OPT=''
+FEATURES_OPT=''
+LEAN_OPT=''
 PLATFORMS_OPT=''
 VERSION_OPT=''
 OPT_YES=0
@@ -318,6 +343,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -p|--platforms)    need_value "$1" "${2:-}"; PLATFORMS_OPT="$2"; shift 2 ;;
     -c|--codecs)       need_value "$1" "${2:-}"; CODECS_OPT="$2"; shift 2 ;;
+    --preset)          need_value "$1" "${2:-}"; PRESET_OPT="$2"; shift 2 ;;
+    --features)        need_value "$1" "${2:-}"; FEATURES_OPT="$2"; shift 2 ;;
+    --lean)            need_value "$1" "${2:-}"; LEAN_OPT="$2"; shift 2 ;;
     -v|--version)      need_value "$1" "${2:-}"; VERSION_OPT="$2"; shift 2 ;;
     -y|--yes)          OPT_YES=1; shift ;;
     -n|--dry-run)      OPT_DRY=1; shift ;;
@@ -368,6 +396,7 @@ want_prompt() {
   if [ ! -t 0 ]; then return 1; fi
   case "$1" in
     codecs)    [ -z "$CODECS_OPT" ] ;;
+    preset)    [ -z "$PRESET_OPT" ] && [ -z "$LEAN_OPT" ] ;;
     platforms) [ -z "$PLATFORMS_OPT" ] ;;
     version)   [ -z "$VERSION_OPT" ] ;;
     *) return 1 ;;
@@ -436,8 +465,9 @@ arch_warnings() {
 # --- questions -------------------------------------------------------------
 say ''
 say "${BOLD}libvips-binaries - selectable build${RESET}   ${DIM}host: $OS_LABEL ($UNAME_M)${RESET}"
-say "${DIM}     core codecs (always built): jpeg, png, webp, tiff, heif/avif, uhdr,"
-say '     gif, svg, exif, lcms, imagequant, archive, highway, text rendering'
+say "${DIM}     always built: jpeg, png, webp, gif load, heif/avif, lcms, magick${RESET}"
+say "${DIM}     preset adds/removes: tiff, dzsave, svgload, textload, UltraHDR,${RESET}"
+say "${DIM}     GIF quantiser, exif and the HEVC encoder (see --help)${RESET}"
 say "${RESET}"
 
 # 1. libvips version
@@ -492,6 +522,46 @@ else
   CODECS='none'
 fi
 
+# 4. build preset + per-feature switches --------------------------------------
+# A preset is the starting point; FEATURES then switches single formats on top of
+# it. Both are also read from the environment, so the CI workflow, the GitHub
+# Action and a hand-written command line all mean the same thing. The old numeric
+# levels are still accepted, and --lean still works as an alias for --preset.
+normalise_preset() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    ''|full|0)                             echo full ;;
+    lean|1)                                echo lean ;;
+    2|aggressive|tiny|tinyest|min|minimum) echo aggressive ;;
+    image|imageonly|images|img)            echo image ;;
+    *)                                     echo '' ;;
+  esac
+}
+if want_prompt preset; then
+  say ''
+  say "${DIM}svgload, textload, UltraHDR and the HEVC encoder are ~43 MB of a Windows DLL${RESET}"
+  say "${DIM}and none of them are needed for jpeg, png, webp, heic/avif or gif${RESET}"
+  ask 'Build preset (1 lean, 2 aggressive, 3 image-only, 4 full)' "${PRESET:-lean}"
+  case "$(printf '%s' "$REPLY" | tr '[:upper:]' '[:lower:]')" in
+    1) REPLY='lean' ;;
+    2) REPLY='aggressive' ;;
+    3) REPLY='image' ;;
+    4) REPLY='full' ;;
+  esac
+  PRESET="$(normalise_preset "$REPLY")"
+  if [ -z "$PRESET" ]; then
+    warn "'$REPLY' is not a preset (full, lean, aggressive or image); using lean"
+    PRESET='lean'
+  fi
+  if confirm 'Switch individual features on top of the preset?' n; then
+    ask 'Overrides as name=on|off pairs (svgload, textload, uhdr, tiffload, dzsave, imagequant, exif, lcms, heif_dec, heif_enc)' ''
+    FEATURES="$REPLY"
+  fi
+else
+  PRESET="$(normalise_preset "${PRESET_OPT:-${LEAN_OPT:-${PRESET:-${LEAN:-}}}}")"
+  [ -n "$PRESET" ] || die "Unknown --preset value: ${PRESET_OPT:-${LEAN_OPT:-${PRESET:-${LEAN}}}} (use full, lean, aggressive or image)"
+  FEATURES="${FEATURES_OPT:-${FEATURES:-}}"
+fi
+
 arch_warnings
 
 # --- summary ---------------------------------------------------------------
@@ -500,10 +570,18 @@ say "${BOLD}About to build${RESET}"
 say "  ${BOLD}version${RESET}  : $VERSION"
 say "  ${BOLD}platforms${RESET} : $(printf '%s\n' $PLATFORMS | tr '\n' ',' | sed 's/,$//')"
 say "  ${BOLD}codecs${RESET}   : $CODECS"
-say "  ${BOLD}always on${RESET}  : jpeg, png, webp, tiff, heif/avif, uhdr, gif, svg, exif, lcms, imagequant, archive, highway, text"
+say "  ${BOLD}preset${RESET}   : $PRESET"
+case "$PRESET" in
+  full) say "  ${BOLD}trimmed${RESET}  : nothing (jpeg, png, webp, tiff, heif/avif, uhdr, gif, svg, exif, lcms, imagequant, archive, highway, text)" ;;
+  lean) say "  ${BOLD}trimmed${RESET}  : svgload, textload, UltraHDR, HEVC encode (x265)" ;;
+  aggressive) say "  ${BOLD}trimmed${RESET}  : as lean, plus tiffload/tiffsave, dzsave (libarchive) and the quantiser (libimagequant, so GIF save is gone)" ;;
+  image) say "  ${BOLD}trimmed${RESET}  : as aggressive, but the quantiser is kept so GIF saving works" ;;
+esac
+[ -n "$FEATURES" ] && say "  ${BOLD}features${RESET} : $FEATURES"
 rule
 say "${DIM}resolved build flags:${RESET}"
-( CODECS="$CODECS" VERSION_VIPS="$VERSION" . "$ROOT_DIR/build-scripts/codecs.sh" 2>&1 | sed 's/^/  /' )
+( CODECS="$CODECS" PRESET="$PRESET" FEATURES="$FEATURES" VERSION_VIPS="$VERSION" \
+  . "$ROOT_DIR/build-scripts/codecs.sh" 2>&1 | sed 's/^/  /' )
 say ''
 
 preflight
@@ -537,10 +615,10 @@ for p in $PLATFORMS; do
   say "${BOLD}${GREEN}==> $p${RESET}  ${DIM}$(platform_desc "$p")${RESET}"
   rule
   if [ "$OPT_DRY" = 1 ]; then
-    say "  dry run: CODECS=\"$CODECS\" bash build.sh $p"
+    say "  dry run: PRESET=\"$PRESET\" CODECS=\"$CODECS\"${FEATURES:+ FEATURES=\"$FEATURES\"} bash build.sh $p"
     continue
   fi
-  if CODECS="$CODECS" bash "$ROOT_DIR/build.sh" "$p"; then
+  if PRESET="$PRESET" CODECS="$CODECS" FEATURES="$FEATURES" bash "$ROOT_DIR/build.sh" "$p"; then
     say "${GREEN}==> $p finished${RESET}"
   else
     warn "build.sh $p failed"

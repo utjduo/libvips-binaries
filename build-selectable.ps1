@@ -18,6 +18,21 @@
 .PARAMETER Codecs
   Comma separated codec list, or 'all' / 'default' / 'none'. Omit it to be asked.
 
+.PARAMETER Preset
+  How much of libvips to build: 'full', 'lean' (the default in interactive
+  mode), 'aggressive' or 'image'. 'lean' drops the svg/text stacks, UltraHDR and
+  the HEVC encoder; 'aggressive' drops TIFF and dzsave as well; 'image' is
+  'aggressive' but keeps the quantiser so GIF saving works. The old numbers are
+  accepted too (0 = full, 1 = lean, 2 = aggressive).
+
+.PARAMETER Features
+  Switch single features on top of the preset, as name=on|off pairs: svgload,
+  textload, uhdr, tiffload, dzsave, imagequant, exif, lcms, heif_dec, heif_enc.
+  Example: -Preset aggressive -Features heif_enc=on,imagequant=on
+
+.PARAMETER Lean
+  Old name for -Preset; still accepted as an alias.
+
 .PARAMETER Platform
   win-x64 (default) or win-arm64 (requires the CLANGARM64 MSYS2 environment).
 
@@ -45,11 +60,18 @@
 
 .EXAMPLE
   .\build-selectable.ps1 -DryRun -Codecs all
+
+.EXAMPLE
+  .\build-selectable.ps1 -Preset image -Codecs spng,openjpeg,jpeg-xl,nsgif -Yes
+  # PNG, GIF (load and save), HEIC/AVIF, JPEG XL and JPEG 2000 in one DLL
 #>
 [CmdletBinding()]
 param(
   [string]$Version,
   [string]$Codecs,
+  [string]$Preset,
+  [string]$Features,
+  [string]$Lean,
   [string]$Platform,
   [string]$Msys2Root,
   [switch]$Clean,
@@ -219,13 +241,20 @@ $interactive = (-not $Yes) -and (-not [Console]::IsInputRedirected)
 
 Write-Host ''
 Write-Host 'libvips-binaries - selectable build (Windows / PowerShell front end)' -ForegroundColor Cyan
-Write-Host '  core codecs (always built):' -ForegroundColor DarkGray
-Write-Host ("    {0}" -f ($builtinCodecs -join ', ')) -ForegroundColor DarkGray
+Write-Host '  always built: jpeg, png, webp, gif load, heif/avif, lcms, magick' -ForegroundColor DarkGray
+Write-Host '  preset controls: tiff, dzsave, svgload, textload, UltraHDR, GIF quantiser, exif, HEVC encoder' -ForegroundColor DarkGray
 
 if ($ListCodecs) {
   Show-Menu -Title 'Optional codecs:' -Items $allCodecs -Notes $CodecNotes
   Write-Host ''
   Write-Host "default selection: $($defaultCodecs -join ', ')"
+  Write-Host ''
+  Write-Host 'Build presets (-Preset):'
+  Write-Host '  full       - keep svgload, textload, dzsave, TIFF, the HEVC encoder and UltraHDR'
+  Write-Host '  lean       - drop those (the HEVC encoder is GPL and needs x265 anyway) [default here]'
+  Write-Host '  aggressive - lean, plus TIFF and archive (dzsave)'
+  Write-Host '  image      - aggressive, but keeps the quantiser so GIF saving works'
+  Write-Host 'Single features (-Features): svgload textload uhdr tiffload dzsave imagequant exif lcms heif_dec heif_enc'
   exit 0
 }
 
@@ -263,6 +292,57 @@ else {
   $chosenCodecs = @($defaultCodecs)
 }
 
+# Build preset, plus optional per-feature switches.
+function Resolve-Preset([string]$Answer) {
+  $a = $Answer.ToLower()
+  switch ($a) {
+    { $_ -in @('', '0', 'full', 'no', 'off', 'false', 'none') } { return 'full' }
+    { $_ -in @('1', 'lean', 'yes', 'on', 'true') } { return 'lean' }
+    { $_ -in @('2', 'aggressive', 'max', 'minimum', 'tiny') } { return 'aggressive' }
+    { $_ -in @('image', 'imageonly', 'images', 'img') } { return 'image' }
+    default { return $null }
+  }
+}
+
+# -Lean is the old name for -Preset and keeps working.
+$requestedPreset = if ($Preset) { $Preset } elseif ($Lean) { $Lean } else { '' }
+if ($requestedPreset) {
+  $resolved = Resolve-Preset $requestedPreset
+  if (-not $resolved) {
+    Write-Error "Unknown -Preset value '$requestedPreset' (use full, lean, aggressive or image)."
+    exit 1
+  }
+  $preset = $resolved
+}
+elseif ($interactive) {
+  Write-Host ''
+  Write-Host 'Build preset (what to drop from the library):' -ForegroundColor Cyan
+  Write-Host '  full       - everything: svgload, textload, dzsave, TIFF, HEVC encoder, UltraHDR' -ForegroundColor DarkGray
+  Write-Host '  lean       - drops the svg/text stacks, the HEVC encoder and UltraHDR [recommended]' -ForegroundColor DarkGray
+  Write-Host '  aggressive - lean, plus TIFF and archive (dzsave)' -ForegroundColor DarkGray
+  Write-Host '  image      - aggressive, but keeps the quantiser so GIF saving works' -ForegroundColor DarkGray
+  $answer = Read-Host 'Build preset [full/lean/aggressive/image, default lean]'
+  if ([string]::IsNullOrWhiteSpace($answer)) { $answer = 'lean' }
+  $resolved = Resolve-Preset $answer
+  if (-not $resolved) {
+    Write-Error "'$answer' is not a preset (full, lean, aggressive or image)."
+    exit 1
+  }
+  $preset = $resolved
+}
+else {
+  # Unattended: honour PRESET (or the old LEAN) from the environment.
+  $fromEnv = if ($env:PRESET) { $env:PRESET } elseif ($env:LEAN) { $env:LEAN } else { '' }
+  $preset = Resolve-Preset $fromEnv
+}
+
+$features = $Features
+if (-not $features -and $env:FEATURES) { $features = $env:FEATURES }
+if (-not $features -and $interactive) {
+  $answer = Read-Host 'Switch individual features (name=on|off pairs, blank keeps the preset)?'
+  if (-not [string]::IsNullOrWhiteSpace($answer)) { $features = $answer }
+}
+
 if ($Platform -eq 'win-x64' -and $chosenCodecs -contains 'openexr') {
   Write-Host '  openexr is not available on Windows (MSYS2 ships it shared-only): it will be left out.' -ForegroundColor Yellow
   $chosenCodecs = @($chosenCodecs | Where-Object { $_ -ne 'openexr' })
@@ -290,6 +370,8 @@ Write-Host "  version   : $Version"
 Write-Host "  platform  : $Platform"
 if ($chosenCodecs.Count -eq 0) { Write-Host '  codecs    : (none extra)' }
 else { Write-Host ('  codecs    : {0}' -f ($chosenCodecs -join ',')) }
+Write-Host "  preset    : $preset"
+if ($features) { Write-Host "  features  : $features" }
 Write-Host '------------------------------------------------------------'
 
 if ($interactive -and -not $DryRun) {
@@ -313,7 +395,8 @@ $bash = Join-Path $msys2 'usr\bin\bash.exe'
 $repoUnix = ConvertTo-MsysPath $Root
 $codecArg = if ($chosenCodecs.Count -eq 0) { 'none' } else { $chosenCodecs -join ',' }
 
-$shellArgs = @('-p', $Platform, '-c', $codecArg, '-v', $Version, '--yes', $cleanFlag)
+$shellArgs = @('-p', $Platform, '-c', $codecArg, '-v', $Version, '--yes', $cleanFlag, '--preset', $preset)
+if ($features) { $shellArgs += @('--features', $features) }
 if ($DryRun) { $shellArgs += '--dry-run' }
 $quoted = ($shellArgs | ForEach-Object { "'{0}'" -f $_ }) -join ' '
 

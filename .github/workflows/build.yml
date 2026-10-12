@@ -24,6 +24,34 @@ on:
         required: false
         default: 'all'
         type: string
+      preset:
+        description: >-
+          Build preset: "full" keeps everything; "lean" drops librsvg (svgload),
+          the Pango/Cairo text stack (textload), libuhdr (UltraHDR) and the x265
+          HEVC encoder; "aggressive" also drops libtiff (tiffload/tiffsave),
+          libarchive (dzsave) and libimagequant (quantisation, and with it
+          gifsave - GIF loading still works); "image" is "aggressive" but keeps
+          libimagequant so GIF saving works. The old numbers work too
+          (0 = full, 1 = lean, 2 = aggressive). Affects every platform.
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - 'full'
+          - 'lean'
+          - 'aggressive'
+          - 'image'
+          - '0'
+          - '1'
+          - '2'
+      features:
+        description: >-
+          Switch single features on top of the preset, as comma-separated
+          name=on|off pairs: svgload, textload, uhdr, tiffload, dzsave,
+          imagequant, exif, lcms, heif_dec, heif_enc.
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -34,6 +62,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CODECS: ${{ inputs.codecs }}
+      PRESET: ${{ inputs.preset }}
+      FEATURES: ${{ inputs.features }}
     strategy:
       fail-fast: false
       matrix:

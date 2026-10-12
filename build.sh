@@ -25,6 +25,17 @@ if [ $# -lt 1 ]; then
   echo "- CODECS       comma-separated optional codecs to build (or 'all'/'default')"
   echo "               supported: spng, openjpeg, openexr, jpeg-xl, fftw, cfitsio,"
   echo "                          matio, raw, ppm, analyze, radiance, qoi, nsgif"
+  echo "- PRESET       full (default), lean, aggressive or image: how much to trim"
+  echo "               lean       = no svgload, no textload, no UltraHDR, no HEVC encode"
+  echo "               aggressive = as lean, plus no tiff, no dzsave, no quantiser"
+  echo "                          (and therefore no gifsave)"
+  echo "               image      = aggressive but keeps the quantiser: the"
+  echo "                          codec-only build, jpeg/png/webp/heic/avif/gif"
+  echo "               LEAN=0/1/2 is the same knob spelled as a number and still works"
+  echo "- FEATURES     override individual features of the preset, e.g."
+  echo "               FEATURES=tiff=on,heif_enc=on"
+  echo "               features: svg text uhdr tiff dzsave imagequant exif lcms"
+  echo "                         heif_dec heif_enc"
   echo
   echo "Note: Windows builds must be run from an MSYS2 shell (the build-scripts/win.sh"
   echo "script links every dependency statically into a single libvips DLL)."
@@ -87,6 +98,13 @@ for flavour in linux-x64 linux-arm64; do
   if [ $PLATFORM = $flavour ]; then
     echo "Building $flavour..."
     docker build --pull -t "vips-dev-$flavour" "platforms/$flavour"
-    docker run --rm -e "CODECS=${CODECS:-}" -v $PWD:/packaging "vips-dev-$flavour" sh -c "/packaging/build-scripts/posix.sh"
+    # PRESET is only forwarded when it was actually set: codecs.sh reads PRESET
+    # before LEAN, so passing a default PRESET would silently override a LEAN=2
+    # request from the caller or the Actions workflow.
+    BUILD_ENV=(-e "CODECS=${CODECS:-}" -e "LEAN=${LEAN:-}" -e "FEATURES=${FEATURES:-}")
+    if [ -n "${PRESET:-}" ]; then
+      BUILD_ENV+=(-e "PRESET=${PRESET}")
+    fi
+    docker run --rm "${BUILD_ENV[@]}" -v $PWD:/packaging "vips-dev-$flavour" sh -c "/packaging/build-scripts/posix.sh"
   fi
 done

@@ -42,10 +42,40 @@ on:
           Optional codecs to build: comma-separated list, or "all"/"default".
           Extra codecs: spng, openjpeg, openexr, jpeg-xl, fftw, cfitsio, matio, raw.
           Built-in formats: ppm, analyze, radiance, qoi, nsgif.
-          Core codecs (jpeg, png, webp, tiff, heif/avif, uhdr, gif, svg, exif,
-          lcms, imagequant, archive, text) are always included.
+          jpeg, png, webp, gif loading, heif/avif and lcms are always included;
+          tiff, dzsave, svgload, textload, UltraHDR, the GIF quantiser, exif and
+          the HEVC encoder depend on the "preset" and "features" inputs below.
         required: false
         default: "all"
+        type: string
+      preset:
+        description: >-
+          Build preset: "full" keeps everything; "lean" (default) drops
+          librsvg (svgload), the Pango/Cairo text stack (textload), libuhdr
+          (UltraHDR) and x265 (HEVC encode) - AVIF encode/decode and HEIC decode
+          stay; "aggressive" drops libtiff (tiffload/tiffsave) and libarchive
+          (dzsave) as well, plus libimagequant, which removes gifsave (GIF
+          loading still works); "image" is "aggressive" but keeps libimagequant
+          so GIF saving works. The old numbers are accepted too (0, 1, 2).
+        required: false
+        default: "lean"
+        type: choice
+        options:
+          - "lean"
+          - "full"
+          - "aggressive"
+          - "image"
+          - "0"
+          - "1"
+          - "2"
+      features:
+        description: >-
+          Switch single features on top of the preset, as comma-separated
+          name=on|off pairs: svgload, textload, uhdr, tiffload, dzsave,
+          imagequant, exif, lcms, heif_dec (HEIC decode), heif_enc (HEVC/HEIC
+          encode through x265). Example: heif_enc=on,imagequant=on
+        required: false
+        default: ""
         type: string
       create_release:
         description: "Create a GitHub Release with all built artifacts"
@@ -103,6 +133,8 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       CODECS: ${{ inputs.codecs }}
+      PRESET: ${{ inputs.preset }}
+      FEATURES: ${{ inputs.features }}
     steps:
       - uses: actions/checkout@v6
 
@@ -165,6 +197,8 @@ jobs:
           # libvips ${{ inputs.version }} binaries
 
           Codecs: \`${{ inputs.codecs }}\`
+
+          Preset: \`${{ inputs.preset }}\`${{ inputs.features && format(' (features: {0})', inputs.features) || '' }}
 
           | Asset | Platform |
           |-------|----------|

@@ -50,6 +50,45 @@ mkdir -p "$DEPS" "$TARGET" "$IMPORT_LIBS"
 
 CURL="curl --silent --location --retry 3 --retry-max-time 30"
 
+# fetch_archive <url> <destination dir> [extra tar options]
+#
+# Piping $CURL straight into tar is fragile: curl without --fail writes the body of
+# an error page into the pipe, tar then unpacks nothing, and the build only dies
+# much later with something like
+#   CMake Error: The source directory ".../deps/jpeg-xl" does not appear to contain
+#   CMakeLists.txt.
+# GitHub source archives also end with a harmless "A lone zero block" warning that
+# makes tar exit non-zero even though everything unpacked, so the archive is fetched
+# to a file first, unpacked, and the unpacked tree is verified before continuing.
+fetch_archive() {
+  local url="$1" dest="$2"
+  shift 2
+  local tmp="$DEPS/.fetch-$(basename "$url")"
+  local attempt
+  mkdir -p "$DEPS"
+  for attempt in 1 2 3; do
+    if $CURL --fail -o "$tmp" "$url"; then
+      break
+    fi
+    echo "Warning: download failed (attempt $attempt/3): $url" >&2
+    sleep 5
+  done
+  if [ ! -s "$tmp" ]; then
+    echo "ERROR: could not download $url" >&2
+    exit 1
+  fi
+  mkdir -p "$dest"
+  # -a picks the compression from the file name; the lone-zero-block noise is
+  # filtered but anything else tar reports is kept.
+  tar -xaf "$tmp" -C "$dest" --strip-components=1 "$@" 2>&1 |
+    grep -v -e 'lone zero block' -e 'Ignoring bad extended header' >&2 || true
+  rm -f "$tmp"
+  if [ ! -d "$dest" ] || [ -z "$(ls -A "$dest" 2>/dev/null)" ]; then
+    echo "ERROR: $url unpacked into an empty directory: $dest" >&2
+    exit 1
+  fi
+}
+
 # config.guess reports the MSYS runtime as "x86_64-pc-cygwin" even in a UCRT64
 # shell, which makes configure scripts take the wrong platform branches - e.g.
 # libarchive then skips archive_windows.c and the finished DLL fails to link
@@ -85,34 +124,68 @@ install_pkgs() {
 PKG="${MINGW_PACKAGE_PREFIX:-mingw-w64-ucrt-x86_64}"
 
 # Build tools: MSYS `make` (for autotools source builds) and a CMake.
-install_pkgs make "${PKG}-cmake"
+# diffutils is needed by libarchive's configure script, which otherwise fails its
+# internal checks with "cmp: command not found" / "diff: command not found".
+install_pkgs make diffutils "${PKG}-cmake"
 
-# Core dependencies (always included)
+# Core dependencies (always included).
+# libiconv: GLib links MSYS2's static libintl.a, whose gettext helpers call
+# libiconv_open()/libiconv(); see the -liconv entry in VIPS_LINK_ARGS below.
 install_pkgs \
   "${PKG}-glib2" \
+  "${PKG}-libiconv" \
   "${PKG}-expat" \
   "${PKG}-libjpeg-turbo" \
   "${PKG}-libpng" \
-  "${PKG}-libtiff" \
   "${PKG}-libwebp" \
   "${PKG}-libheif" \
-  "${PKG}-lcms2" \
-  "${PKG}-libexif" \
-  "${PKG}-libxml2" \
-  "${PKG}-fribidi" \
-  "${PKG}-freetype" \
-  "${PKG}-harfbuzz" \
-  "${PKG}-fontconfig" \
-  "${PKG}-cairo" \
-  "${PKG}-pango" \
-  "${PKG}-librsvg" \
   "${PKG}-libffi" \
-  "${PKG}-libimagequant" \
-  "${PKG}-libarchive" \
   "${PKG}-highway" \
-  "${PKG}-libde265" \
-  "${PKG}-x265" \
   "${PKG}-zlib"
+
+# Metadata and colour management. Small (a few hundred KB together) and every
+# codec in this build stores EXIF/ICC profiles, so they are on unless something
+# switches them off (FEATURES=exif=off,lcms=off).
+if [ "${HAVE_EXIF}" = 1 ]; then install_pkgs "${PKG}-libexif"; fi
+if [ "${HAVE_LCMS}" = 1 ]; then install_pkgs "${PKG}-lcms2"; fi
+
+# libde265 is the HEVC *decoder* libheif uses to read .heic. Without it heifload
+# is still registered but every real .heic fails with "Unsupported compression",
+# which is indistinguishable from a broken build, so it stays on in every preset.
+if [ "${HAVE_HEIF_DEC}" = 1 ]; then install_pkgs "${PKG}-libde265"; fi
+
+# TIFF is part of the historical core set; LEAN=2 drops it (and with it the
+# zstd/lzma/jbig/libdeflate archives MSYS2's libtiff drags in).
+if [ "${HAVE_TIFF}" = 1 ]; then
+  install_pkgs "${PKG}-libtiff"
+fi
+
+# The svgload stack: librsvg pulls cairo + pixman + gdk-pixbuf + libxml2, and
+# cairo pulls freetype + fontconfig. Together they are ~15 MB of the DLL.
+if [ "${HAVE_SVG}" = 1 ]; then
+  install_pkgs "${PKG}-libxml2" "${PKG}-freetype" "${PKG}-fontconfig" \
+    "${PKG}-cairo" "${PKG}-librsvg"
+fi
+
+# The textload stack: pango pulls harfbuzz + fribidi (+ graphite2, datrie, thai).
+if [ "${HAVE_TEXT_STACK}" = 1 ]; then
+  install_pkgs "${PKG}-fribidi" "${PKG}-harfbuzz" "${PKG}-pango"
+fi
+
+if [ "${HAVE_IMAGEQUANT}" = 1 ]; then
+  install_pkgs "${PKG}-libimagequant"
+fi
+
+if [ "${HAVE_DZSAVE}" = 1 ]; then
+  install_pkgs "${PKG}-libarchive"
+fi
+
+# x265 is only needed to *encode* HEVC/HEIC through libheif; HEVC *decoding*
+# uses libde265, which every preset keeps. x265 alone is ~21 MB of the DLL and
+# it is GPL, so it is opt-in (FEATURES=heif_enc=on, or HEIF_HEVC_ENCODER=on).
+if [ "${HAVE_HEIF_ENC}" = 1 ]; then
+  install_pkgs "${PKG}-x265"
+fi
 # MSYS2 does not package cgif, so it is built from source below (GIF *save*;
 # GIF *load* uses the bundled nsgif).
 
@@ -197,26 +270,82 @@ export PKG_CONFIG="$DEPS/pkg-config-static"
 unset PKG_CONFIG_PATH
 unset PKG_CONFIG_LIBDIR
 
+# MSYS2's libspng ships its static archive as libspng_static.a, but libspng.pc asks
+# for -lspng - the import library that was just moved aside above (and which UCRT64
+# does not even provide as libspng.a). Without a fix a selected "spng" codec either
+# fails to link with "cannot find -lspng" or is silently dropped back to libpng.
+# Publish a pkg-config override that maps both names libvips tries - it looks for
+# 'spng' first, then 'libspng' (see deps/vips/meson.build) - onto the static archive.
+PKG_CONFIG_OVERRIDE="$DEPS/pkgconfig-override"
+if codec_on spng; then
+  if [ -f "${MINGW_PREFIX_DIR}/lib/libspng_static.a" ] &&
+     [ -f "${MINGW_PREFIX_DIR}/lib/pkgconfig/libspng_static.pc" ]; then
+    mkdir -p "$PKG_CONFIG_OVERRIDE"
+    for pc_name in spng libspng; do
+      sed -e "s/^Name:.*/Name: ${pc_name} (static)/" \
+        -e "s/^Description:.*/Description: PNG decoding and encoding library (static build)/" \
+        "${MINGW_PREFIX_DIR}/lib/pkgconfig/libspng_static.pc" > "$PKG_CONFIG_OVERRIDE/${pc_name}.pc"
+    done
+    export PKG_CONFIG_PATH="$PKG_CONFIG_OVERRIDE"
+    echo "Linking PNG through static libspng: $(cat "$PKG_CONFIG_OVERRIDE/libspng.pc" | grep '^Libs:' | cut -d= -f2)"
+  else
+    echo "Warning: libspng static archive not found; PNG will fall back to libpng" >&2
+  fi
+fi
+
 # Definitions needed to consume the static libraries on Windows. Defining a
 # macro that a given library does not use is harmless.
+# SPNG_STATIC matters: without it spng.h expands to __declspec(dllimport), so the
+# PNG code emits __imp_spng_* references and the link against libspng_static.a
+# fails with "undefined reference to `__imp_spng_ctx_free'".
 CPPFLAGS_DEFS="-DGLIB_STATIC_COMPILATION -DGOBJECT_STATIC_COMPILATION -DGIO_STATIC_COMPILATION -DG_MODULE_STATIC_COMPILATION"
 CPPFLAGS_DEFS="${CPPFLAGS_DEFS} -DLIBXML_STATIC -DXML_STATIC -DPCRE2_STATIC -DPNG_STATIC"
 CPPFLAGS_DEFS="${CPPFLAGS_DEFS} -DJXL_STATIC_DEFINE -DOPENEXR_STATIC_DEFINE -DIMATH_STATIC_DEFINE"
-CPPFLAGS_DEFS="${CPPFLAGS_DEFS} -DBROTLI_STATIC_DEFINE -DTIFF_STATIC -DLIBRAW_STATIC"
+CPPFLAGS_DEFS="${CPPFLAGS_DEFS} -DBROTLI_STATIC_DEFINE -DTIFF_STATIC -DLIBRAW_STATIC -DSPNG_STATIC"
 CPPFLAGS_DEFS="${CPPFLAGS_DEFS} -DCAIRO_WIN32_STATIC_BUILD -DLIBARCHIVE_STATIC"
 export CPPFLAGS="${CPPFLAGS_DEFS}"
-export CFLAGS="-O3"
-export CXXFLAGS="-O3"
+# Every dependency built from source (and libvips itself) is compiled at -O3 for
+# speed, but with one section per function and per data object so the final link
+# can discard whatever is never referenced (-Wl,--gc-sections below). MSYS2's own
+# archives are not section-split, so this only trims the code we compile here -
+# it is free, though: no optimisation is given up.
+SECTION_FLAGS="-ffunction-sections -fdata-sections"
+export CFLAGS="-O3 ${SECTION_FLAGS}"
+export CXXFLAGS="-O3 ${SECTION_FLAGS}"
+DEP_CFLAGS="${SECTION_FLAGS}"
+DEP_CXXFLAGS="${SECTION_FLAGS}"
 
 # ---------------------------------------------------------------------------
 # Download and build libvips from source
 # ---------------------------------------------------------------------------
-mkdir -p "$DEPS/vips"
-$CURL "https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips-${VERSION_VIPS}.tar.xz" \
-  | tar xJC "$DEPS/vips" --strip-components=1
+fetch_archive "https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips-${VERSION_VIPS}.tar.xz" "$DEPS/vips"
 cd "$DEPS/vips"
-# Disable HBR support in heifsave
-$CURL "https://raw.githubusercontent.com/libvips/build-win64-mxe/v${VERSION_VIPS}/build/patches/vips-8-heifsave-disable-hbr-support.patch" | patch -p1
+# Disable HBR support in heifsave.
+#
+# This patch used to be published per release tag by libvips/build-win64-mxe, but
+# upstream deleted it (2026-06-06, "aom: enable HDR support, allows bit depths of
+# 10 and 12") and libvips >= 8.18 has no HBR code left in libvips/foreign/heifsave.c
+# at all. Fetch it with --fail into a file instead of piping $CURL straight into
+# patch: without --fail a 404 page is fed to patch as input and the build dies with
+#   patch: **** Only garbage was found in the patch input.
+# A patch that is missing or does not apply is a warning, not a failure.
+apply_vips_heifsave_hbr_patch() {
+  local patch_url="https://raw.githubusercontent.com/libvips/build-win64-mxe/v${VERSION_VIPS}/build/patches/vips-8-heifsave-disable-hbr-support.patch"
+  local patch_file="$DEPS/vips-heifsave-hbr.patch"
+  if ! $CURL --fail -o "$patch_file" "$patch_url" 2>/dev/null; then
+    echo "heifsave HBR patch is not published for vips ${VERSION_VIPS}; nothing to patch"
+    return 0
+  fi
+  # -N: never prompt for the reversed-patch question, which would hang a
+  # non-interactive build if the patch were already applied.
+  if patch -N -p1 -i "$patch_file"; then
+    echo "Applied heifsave HBR patch"
+  else
+    echo "Warning: heifsave HBR patch does not apply to vips ${VERSION_VIPS}; skipping" >&2
+  fi
+  rm -f "$patch_file"
+}
+apply_vips_heifsave_hbr_patch
 # Link libvips statically into libvips-cpp so we get a single DLL
 sed -i'.bak' "s/library('vips'/static_&/" libvips/meson.build
 sed -i'.bak' "/version: library_version/{N;d;}" libvips/meson.build
@@ -232,8 +361,7 @@ sed -i'.bak' "/subdir('man')/{N;N;N;N;d;}" meson.build
 sed -i.bak 's/ -DHWY_SHARED_DEFINE//' "${MINGW_PREFIX_DIR}/lib/pkgconfig/libhwy.pc" || true
 
 # cgif (GIF save): not packaged by MSYS2 at all, so build it statically.
-mkdir -p "$DEPS/cgif"
-$CURL "https://github.com/dloebl/cgif/archive/v${VERSION_CGIF}.tar.gz" | tar xzC "$DEPS/cgif" --strip-components=1
+fetch_archive "https://github.com/dloebl/cgif/archive/v${VERSION_CGIF}.tar.gz" "$DEPS/cgif"
 cd "$DEPS/cgif"
 CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix="$MINGW_PREFIX_DIR" \
   -Dexamples=false -Dtests=false
@@ -242,29 +370,33 @@ meson install -C _build
 # libuhdr (JPEG Ultra HDR): MSYS2 has no package for it at all, so build it
 # statically from source exactly like build-scripts/posix.sh does. Without this the
 # "uhdr" codec the workflow advertises as always-included is silently missing
-# from the Windows build.
-mkdir -p "$DEPS/uhdr"
-$CURL "https://github.com/google/libultrahdr/archive/${VERSION_UHDR}.tar.gz" | tar xzC "$DEPS/uhdr" --strip-components=1
-cd "$DEPS/uhdr"
-# [PATCH] Remove platform and architecture detection logic
-$CURL "https://patch-diff.githubusercontent.com/raw/google/libultrahdr/pull/383.patch" | patch -p1
-CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
-  -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX_DIR" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_SHARED_LIBS=FALSE -DUHDR_BUILD_EXAMPLES=FALSE -DUHDR_BUILD_TESTS=FALSE \
-  -DUHDR_BUILD_DEPS=FALSE -DUHDR_MAX_DIMENSION=65500
-make install/strip
+# from the Windows build. Skipped when LEAN trims UltraHDR support.
+if [ "${HAVE_UHDR}" = 1 ]; then
+  fetch_archive "https://github.com/google/libultrahdr/archive/${VERSION_UHDR}.tar.gz" "$DEPS/uhdr"
+  cd "$DEPS/uhdr"
+  # [PATCH] Remove platform and architecture detection logic
+  $CURL "https://patch-diff.githubusercontent.com/raw/google/libultrahdr/pull/383.patch" | patch -p1
+  CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
+    -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX_DIR" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=FALSE -DUHDR_BUILD_EXAMPLES=FALSE -DUHDR_BUILD_TESTS=FALSE \
+    -DUHDR_BUILD_DEPS=FALSE -DUHDR_MAX_DIMENSION=65500
+  make install/strip
+  cd "$DEPS/vips"
+fi
 
 # libarchive: MSYS2's static archive references the zlib DLL import stubs, so
 # build a static copy from source (dzsave support).
-mkdir -p "$DEPS/archive"
-$CURL "https://github.com/libarchive/libarchive/releases/download/v${VERSION_ARCHIVE}/libarchive-${VERSION_ARCHIVE}.tar.xz" | tar xJC "$DEPS/archive" --strip-components=1
-cd "$DEPS/archive"
-./configure $CONFIGURE_HOST --prefix="$MINGW_PREFIX_DIR" --enable-static --disable-shared --disable-dependency-tracking \
-  --disable-bsdtar --disable-bsdcat --disable-bsdcpio --disable-bsdunzip \
-  --disable-xattr --disable-acl --disable-posix-regex-lib \
-  --without-bz2lib --without-libb2 --without-iconv --without-lz4 --without-zstd --without-lzma \
-  --without-lzo2 --without-cng --without-openssl --without-xml2 --without-expat
-make install-strip
+if [ "${HAVE_DZSAVE}" = 1 ]; then
+  fetch_archive "https://github.com/libarchive/libarchive/releases/download/v${VERSION_ARCHIVE}/libarchive-${VERSION_ARCHIVE}.tar.xz" "$DEPS/archive"
+  cd "$DEPS/archive"
+  ./configure $CONFIGURE_HOST --prefix="$MINGW_PREFIX_DIR" --enable-static --disable-shared --disable-dependency-tracking \
+    --disable-bsdtar --disable-bsdcat --disable-bsdcpio --disable-bsdunzip \
+    --disable-xattr --disable-acl --disable-posix-regex-lib \
+    --without-bz2lib --without-libb2 --without-iconv --without-lz4 --without-zstd --without-lzma \
+    --without-lzo2 --without-cng --without-openssl --without-xml2 --without-expat
+  make install-strip
+  cd "$DEPS/vips"
+fi
 
 # libheif: only shipped as a shared library; build it statically (AVIF via aom).
 # Its AOM CMake config points at the import library we moved aside, so set it
@@ -272,22 +404,87 @@ make install-strip
 if [ -d "${MINGW_PREFIX_DIR}/lib/cmake/AOM" ]; then
   mv -f "${MINGW_PREFIX_DIR}/lib/cmake/AOM" "$IMPORT_LIBS/AOM"
 fi
-mkdir -p "$DEPS/heif"
-$CURL "https://github.com/strukturag/libheif/archive/${VERSION_HEIF}.tar.gz" | tar xzC "$DEPS/heif" --strip-components=1
+
+# aom is what libheif uses for AVIF. MSYS2's libaom.a is 12 MB because it is
+# built with VP8/VP9 I/O (CONFIG_WEBM_IO) and 10/12-bit AV1 support
+# (CONFIG_AV1_HIGHBITDEPTH), neither of which an AVIF encoder/decoder needs.
+# Rebuilding it with the same switches build-scripts/posix.sh uses (MinSizeRel,
+# CONFIG_WEBM_IO=0, CONFIG_AV1_HIGHBITDEPTH=0) removes roughly a third of it.
+# AOM_BUILD=auto (the default) only does this for LEAN builds, where the size
+# matters; AOM_BUILD=on/off forces it either way. If the source build fails the
+# packaged archive is used instead so the build still finishes.
+AOM_BUILD="${AOM_BUILD:-auto}"
+case "$AOM_BUILD" in
+  auto)
+    if [ "${LEAN:-0}" -ge 1 ]; then AOM_BUILD=1; else AOM_BUILD=0; fi
+    ;;
+  on|true|yes|1) AOM_BUILD=1 ;;
+  off|false|no|0) AOM_BUILD=0 ;;
+  *)
+    echo "Warning: AOM_BUILD='$AOM_BUILD' is not understood (auto/on/off); using auto" >&2
+    if [ "${LEAN:-0}" -ge 1 ]; then AOM_BUILD=1; else AOM_BUILD=0; fi
+    ;;
+esac
+
+build_aom_minimal() {
+  local jobs
+  jobs="$(nproc 2>/dev/null || echo 4)"
+  # aom's x86-64 assembly is what makes AV1 fast; without nasm CMake silently
+  # falls back to the C implementation.
+  command -v nasm >/dev/null 2>&1 || install_pkgs "${PKG}-nasm"
+  if ! command -v nasm >/dev/null 2>&1; then
+    echo "Warning: nasm not available; skipping the minimal aom build (AV1 would be slow)" >&2
+    return 1
+  fi
+  fetch_archive "https://storage.googleapis.com/aom-releases/libaom-${VERSION_AOM}.tar.gz" "$DEPS/aom"
+  mkdir -p "$DEPS/aom/aom_build"
+  cd "$DEPS/aom/aom_build"
+  cmake -G"Unix Makefiles" \
+    -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX_DIR" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=MinSizeRel \
+    -DBUILD_SHARED_LIBS=FALSE -DENABLE_DOCS=0 -DENABLE_TESTS=0 -DENABLE_TESTDATA=0 \
+    -DENABLE_TOOLS=0 -DENABLE_EXAMPLES=0 \
+    -DCONFIG_PIC=1 -DENABLE_NASM=1 -DENABLE_RVV=0 \
+    -DCONFIG_AV1_HIGHBITDEPTH=0 -DCONFIG_WEBM_IO=0 .. || return 1
+  make -j"$jobs" install/strip || return 1
+  cd "$DEPS/vips"
+  echo "Built a minimal aom (${VERSION_AOM}, MinSizeRel, no WebM I/O, 8-bit AV1 only)"
+  return 0
+}
+
+if [ "$AOM_BUILD" = 1 ] && build_aom_minimal; then
+  :
+elif [ "$AOM_BUILD" = 1 ]; then
+  echo "Warning: the minimal aom build failed; linking MSYS2's packaged libaom.a instead" >&2
+  install_pkgs "${PKG}-aom"
+fi
+
+fetch_archive "https://github.com/strukturag/libheif/archive/${VERSION_HEIF}.tar.gz" "$DEPS/heif"
 cd "$DEPS/heif"
-CFLAGS="${CFLAGS} -O3 -DLIBDE265_STATIC_BUILD" CXXFLAGS="${CXXFLAGS} -O3 -DLIBDE265_STATIC_BUILD" cmake -G"Unix Makefiles" \
+# WITH_X265 is the HEVC *encoder* (heifsave). It is the single biggest archive
+# in the DLL (~21 MB) and it is GPL, so every preset except "full" switches it
+# off (FEATURES=heif_enc=on brings it back). WITH_LIBDE265 is the HEVC *decoder*
+# and stays on, so .heic/.h265 files still load, and WITH_AOM_* keeps AVIF
+# encode + decode.
+HEIF_ENCODER_FLAG=OFF
+if [ "${HAVE_HEIF_ENC}" = 1 ]; then
+  HEIF_ENCODER_FLAG=ON
+fi
+HEIF_DECODER_FLAG=OFF
+if [ "${HAVE_HEIF_DEC}" = 1 ]; then
+  HEIF_DECODER_FLAG=ON
+fi
+CFLAGS="${CFLAGS} ${DEP_CFLAGS} -DLIBDE265_STATIC_BUILD" CXXFLAGS="${CXXFLAGS} ${DEP_CXXFLAGS} -DLIBDE265_STATIC_BUILD" cmake -G"Unix Makefiles" \
   -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX_DIR" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_SHARED_LIBS=FALSE -DBUILD_DOCUMENTATION=0 -DBUILD_TESTING=0 -DENABLE_PLUGIN_LOADING=0 -DWITH_EXAMPLES=0 \
   -DWITH_AOM_DECODER=ON -DWITH_AOM_ENCODER=ON \
-  -DWITH_LIBDE265=ON -DWITH_X265=ON -DWITH_X264=OFF -DWITH_OpenH264_DECODER=OFF \
+  -DWITH_LIBDE265=${HEIF_DECODER_FLAG} -DWITH_X265=${HEIF_ENCODER_FLAG} -DWITH_X264=OFF -DWITH_OpenH264_DECODER=OFF \
   -DWITH_DAV1D=OFF -DWITH_SvtEnc=OFF -DWITH_RAV1E=OFF
 make install/strip
 
 # matio (Matlab): its MSYS2 package links against shared-only hdf5, so build a
 # static matio without HDF5 instead.
 if codec_on matio; then
-  mkdir -p "$DEPS/matio"
-  $CURL "https://github.com/tbeu/matio/releases/download/v${VERSION_MATIO}/matio-${VERSION_MATIO}.tar.gz" | tar xzC "$DEPS/matio" --strip-components=1
+  fetch_archive "https://github.com/tbeu/matio/releases/download/v${VERSION_MATIO}/matio-${VERSION_MATIO}.tar.gz" "$DEPS/matio"
   cd "$DEPS/matio"
   ./configure $CONFIGURE_HOST --prefix="$MINGW_PREFIX_DIR" --enable-static --disable-shared --disable-dependency-tracking \
     --without-hdf5 --disable-mat73
@@ -297,8 +494,7 @@ fi
 # cfitsio: MSYS2's static archive references the curl DLL import stubs; build a
 # static copy without curl instead.
 if codec_on cfitsio; then
-  mkdir -p "$DEPS/cfitsio"
-  $CURL "https://heasarc.gsfc.nasa.gov/FTP/software/fitsio/c/cfitsio-${VERSION_CFITSIO}.tar.gz" | tar xzC "$DEPS/cfitsio" --strip-components=1
+  fetch_archive "https://heasarc.gsfc.nasa.gov/FTP/software/fitsio/c/cfitsio-${VERSION_CFITSIO}.tar.gz" "$DEPS/cfitsio"
   cd "$DEPS/cfitsio"
   CFLAGS="${CFLAGS} -std=gnu17" ./configure $CONFIGURE_HOST --prefix="$MINGW_PREFIX_DIR" --enable-static --disable-shared --disable-dependency-tracking --disable-curl
   # the utilities (e.g. smem) need SysV shared memory, so only build the library
@@ -310,8 +506,8 @@ fi
 # statically from source against the static highway + brotli (libhwy.pc had
 # -DHWY_SHARED_DEFINE removed above).
 if codec_on jpeg-xl; then
-  mkdir -p "$DEPS/jpeg-xl"
-  $CURL "https://github.com/libjxl/libjxl/archive/v${VERSION_JPEGXL}.tar.gz" | tar xzC "$DEPS/jpeg-xl" --strip-components=1 --exclude='*/tools/benchmark/*' 2>/dev/null || true
+  fetch_archive "https://github.com/libjxl/libjxl/archive/v${VERSION_JPEGXL}.tar.gz" "$DEPS/jpeg-xl" \
+    --exclude='*/tools/benchmark/*'
   cd "$DEPS/jpeg-xl"
   CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
     -DCMAKE_INSTALL_PREFIX="$MINGW_PREFIX_DIR" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
@@ -392,10 +588,60 @@ if codec_on openexr; then
   echo "Warning: 'openexr' was requested but MSYS2 ships it shared-only; it cannot be linked into a single DLL and is being disabled." >&2
 fi
 
+# libvips has exactly one PNG backend. meson only looks for spng when libpng was
+# not found ("only if libpng not found" in libvips meson.build), and libpng is
+# always installed here, so asking for the "spng" codec did nothing at all: the
+# DLL kept the libpng backend and neither HAVE_SPNG nor pngspngload was built.
+# Honour the selection by switching libvips over to the spng backend.
+PNG_BACKEND_FLAGS=""
+PNG_WRAPPER_LINK_ARGS=""
+if codec_on spng; then
+  # -Dspng=enabled makes libspng a hard requirement: without it meson treats it as
+  # optional and a missing libspng would leave the finished DLL with no PNG support
+  # at all, because libpng was switched off.
+  PNG_BACKEND_FLAGS="-Dpng=disabled -Dspng=enabled"
+  # libvips has exactly one PNG backend. meson only looks for spng when libpng was
+  # not found ("only if libpng not found" in libvips meson.build), and libpng is
+  # always installed here, so asking for the "spng" codec did nothing at all: the
+  # DLL kept the libpng backend and neither HAVE_SPNG nor the spng classes were
+  # built. Honour the selection by switching libvips over to the spng backend.
+  echo "PNG backend: libspng (libpng is disabled for this build - libvips links one PNG backend at a time)"
+  # The vips_pngload()/vips_pngsave() convenience wrappers live in pngload.c and
+  # pngsave.c *outside* their #ifdef HAVE_PNG blocks, so they are compiled even
+  # though the libpng classes are not - but nothing else in the DLL references
+  # them, so -Wl,--gc-sections discards them and a consumer that calls
+  # vips_pngsave() gets "undefined reference to `vips_pngsave'". Naming them as
+  # undefined symbols makes ld pull those objects out of the archive and keep
+  # them, so the spng DLL exports the same C API as the libpng one.
+  PNG_WRAPPER_LINK_ARGS=",'-Wl,--undefined=vips_pngload','-Wl,--undefined=vips_pngload_buffer','-Wl,--undefined=vips_pngload_source','-Wl,--undefined=vips_pngsave','-Wl,--undefined=vips_pngsave_buffer','-Wl,--undefined=vips_pngsave_target'"
+  echo "PNG wrappers: forcing vips_pngload()/vips_pngsave() into the export table"
+fi
+
+# cgifsave.c is only compiled when the quantiser is available, and nothing else
+# in the DLL calls vips_gifsave(), so the same gc-sections argument applies:
+# name the gif writers explicitly so a trimmed-but-quantised build still exports
+# them. HEVC/AVIF, JXL and JPEG 2000 wrappers are already pulled in by the
+# heif/jxl/jp2k classes and need nothing extra.
+WRAPPER_LINK_ARGS="${PNG_WRAPPER_LINK_ARGS}"
+if [ "${HAVE_IMAGEQUANT}" = 1 ]; then
+  WRAPPER_LINK_ARGS="${WRAPPER_LINK_ARGS},'-Wl,--undefined=vips_gifsave','-Wl,--undefined=vips_gifsave_buffer','-Wl,--undefined=vips_gifsave_target'"
+fi
+
+
 # Meson receives the link flags as one array; the response-file reference is only
 # appended when there is something to hide, so an empty element never ends up in
 # the link command.
-VIPS_LINK_ARGS="'-Wl,--allow-multiple-definition','-static-libgcc','-Wl,--export-all-symbols','-Wl,--exclude-libs=$EXCLUDE_LIBS_LIST'"
+#
+# -liconv: GLib links MSYS2's static libintl.a, whose gettext helpers call
+# libiconv_open()/libiconv(). A full build gets that archive from the pango /
+# fontconfig / cairo link lines; a trimmed (LEAN) build has nothing left to drag
+# it in, so it must be named explicitly - without it the link stops with
+# "undefined reference to `libiconv_open'".
+ICONV_LINK_ARG=""
+if [ -f "${MINGW_PREFIX_DIR}/lib/libiconv.a" ]; then
+  ICONV_LINK_ARG=",'-liconv'"
+fi
+VIPS_LINK_ARGS="'-Wl,--allow-multiple-definition','-static-libgcc','-Wl,--export-all-symbols','-Wl,--gc-sections'${ICONV_LINK_ARG}${WRAPPER_LINK_ARGS},'-Wl,--exclude-libs=$EXCLUDE_LIBS_LIST'"
 if [ -n "$EXPORT_RSP_FLAG" ]; then
   VIPS_LINK_ARGS="$VIPS_LINK_ARGS,'$EXPORT_RSP_FLAG'"
 fi
@@ -404,7 +650,7 @@ meson setup _build --default-library=shared --buildtype=release --strip --prefix
   -Ddeprecated=false -Dexamples=false -Dintrospection=disabled -Dmodules=disabled \
   "-Dc_link_args=[$VIPS_LINK_ARGS]" \
   "-Dcpp_link_args=[$VIPS_LINK_ARGS]" \
-  ${VIPS_CODEC_FLAGS_AUTO} ${WIN_UNSUPPORTED_FLAGS}
+  ${VIPS_CODEC_FLAGS_AUTO} ${WIN_UNSUPPORTED_FLAGS} ${PNG_BACKEND_FLAGS}
 meson install -C _build
 # ---------------------------------------------------------------------------
 # Collect the single DLL and its import library
@@ -511,21 +757,67 @@ add_version() {
 "
 }
 add_version vips "${VERSION_VIPS}"
-for spec in \
-  glib:glib2 expat:expat mozjpeg:libjpeg-turbo png:libpng tiff:libtiff \
-  webp:libwebp heif:libheif lcms:lcms2 exif:libexif xml2:libxml2 \
-  fribidi:fribidi freetype:freetype harfbuzz:harfbuzz fontconfig:fontconfig \
-  cairo:cairo pango:pango rsvg:librsvg ffi:libffi imagequant:libimagequant \
-  archive:libarchive highway:highway zlib:zlib spng:libspng \
-  openjpeg:openjpeg2 openexr:openexr jpeg-xl:libjxl fftw:fftw cfitsio:cfitsio \
-  matio:matio raw:libraw
-do
-  name="${spec%%:*}"
-  pkgname="${PKG}-${spec#*:}"
-  ver="$(pacman -Q "$pkgname" 2>/dev/null | awk '{print $2}')"
+add_pkg_version() {
+  # add_pkg_version <reported name> <pacman package suffix>
+  local ver
+  ver="$(pacman -Q "${PKG}-$2" 2>/dev/null | awk '{print $2}')"
   ver="${ver%-*}"
   if [ -n "$ver" ]; then
-    add_version "$name" "$ver"
+    add_version "$1" "$ver"
+  fi
+}
+# Core dependencies: always linked into the DLL.
+for spec in \
+  glib:glib2 expat:expat mozjpeg:libjpeg-turbo webp:libwebp heif:libheif \
+  ffi:libffi highway:highway zlib:zlib
+do
+  add_pkg_version "${spec%%:*}" "${spec#*:}"
+done
+# The features the preset can trim are reported only when this build really
+# linked them. pacman keeps answering for packages an earlier full build
+# installed, so an ungated loop advertises rsvg/pango/tiff versions that are not
+# in the DLL.
+if [ "${HAVE_EXIF}" = 1 ]; then add_pkg_version exif libexif; fi
+if [ "${HAVE_LCMS}" = 1 ]; then add_pkg_version lcms lcms2; fi
+if [ "${HAVE_HEIF_DEC}" = 1 ]; then add_pkg_version de265 libde265; fi
+if [ "${HAVE_HEIF_ENC}" = 1 ]; then add_pkg_version x265 x265; fi
+if [ "${HAVE_TIFF}" = 1 ]; then add_pkg_version tiff libtiff; fi
+if [ "${HAVE_SVG}" = 1 ]; then
+  for spec in xml2:libxml2 freetype:freetype fontconfig:fontconfig \
+    cairo:cairo rsvg:librsvg
+  do
+    add_pkg_version "${spec%%:*}" "${spec#*:}"
+  done
+fi
+if [ "${HAVE_TEXT_STACK}" = 1 ]; then
+  for spec in fribidi:fribidi harfbuzz:harfbuzz pango:pango
+  do
+    add_pkg_version "${spec%%:*}" "${spec#*:}"
+  done
+fi
+if [ "${HAVE_IMAGEQUANT}" = 1 ]; then add_pkg_version imagequant libimagequant; fi
+if [ "${HAVE_DZSAVE}" = 1 ]; then add_pkg_version archive libarchive; fi
+# The feature set itself, so a consumer - and build-scripts/smoke-test.sh - can
+# tell which formats are missing on purpose without re-running the build.
+add_version preset "${PRESET:-full}"
+add_version lean "${LEAN:-0}"
+add_version features "${FEATURES:-}"
+add_version cgif "${VERSION_CGIF}"
+# PNG: libvips links a single PNG backend, so report whichever one was configured.
+if codec_on spng; then
+  add_pkg_version spng libspng
+else
+  add_pkg_version png libpng
+fi
+# Optional codecs: report only the ones this build actually enabled. Querying
+# every package the script knows about advertises versions for libraries that are
+# not in the DLL at all whenever an unrelated build installed them on this machine
+# (openexr/fftw/cfitsio/matio/raw used to appear even when they were disabled).
+# openexr is left out entirely because build-scripts/win.sh always disables it.
+for spec in openjpeg:openjpeg2 jpeg-xl:libjxl fftw:fftw cfitsio:cfitsio matio:matio raw:libraw
+do
+  if codec_on "${spec%%:*}"; then
+    add_pkg_version "${spec%%:*}" "${spec#*:}"
   fi
 done
 printf "{\n%s\n}\n" "$VERSIONS_JSON" > "$TARGET/versions.json"
@@ -538,6 +830,23 @@ if [ -f "$PACKAGE/THIRD-PARTY-NOTICES.md" ]; then
 else
   $CURL --fail -O https://raw.githubusercontent.com/CodeWithKyrian/libvips-binaries/main/THIRD-PARTY-NOTICES.md \
     || echo "Warning: could not fetch THIRD-PARTY-NOTICES.md" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Smoke test the package that was just built.
+#
+# build-scripts/smoke-test.sh compiles build-scripts/smoke-test.c against
+# target/lib/pkgconfig/vips.pc and runs it with target/lib on PATH, so this
+# checks the shipped DLL rather than the one in deps/vips/_build. It also reads
+# the "lean" entry from versions.json, so formats LEAN trimmed on purpose are
+# reported as trimmed instead of failing the build. Set SMOKE_TEST=0 to skip it.
+# ---------------------------------------------------------------------------
+if [ "${SMOKE_TEST:-1}" != 0 ]; then
+  echo "Smoke testing the package in $TARGET..."
+  if ! bash "$PACKAGE/build-scripts/smoke-test.sh" ${CODECS}; then
+    echo "ERROR: the smoke test failed - the library in $TARGET is not usable." >&2
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------

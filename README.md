@@ -56,6 +56,8 @@ attached to a GitHub Release).
 | `linux_arm`      | boolean | Build Linux arm64 (`linux-arm64`)                           |
 | `win_x64`        | boolean | Build Windows x86_64 (`win-x64`)                            |
 | `codecs`         | string  | Optional codecs: comma-separated list, or `all` / `default` |
+| `preset`         | choice  | Build preset: `full`, `lean`, `aggressive`, `image`         |
+| `features`       | string  | Single features on top of the preset, `name=on\|off` pairs  |
 | `create_release` | boolean | Publish the built tarballs as a GitHub Release              |
 
 > GitHub allows a maximum of **10** `workflow_dispatch` inputs, which is why
@@ -64,9 +66,10 @@ attached to a GitHub Release).
 
 ### Codecs
 
-**Core codecs are always included** (no option needed): JPEG, PNG, WebP, TIFF,
-HEIF/AVIF, UHDR (gain maps), GIF, SVG, EXIF, LCMS, imagequant, archive, highway
-and the Pango/Cairo/FontConfig/HarfBuzz text-rendering stack.
+**Always included** (no option needed): JPEG, PNG, WebP, GIF loading, HEIF/AVIF,
+EXIF, LCMS and the magick loader that `svgload` uses. TIFF, `dzsave`, `svgload`,
+`textload`, UltraHDR, the GIF quantiser (and with it GIF **saving**) and the HEVC
+encoder depend on the build preset - see [Build presets](#build-presets-preset-and-single-features-features).
 
 `codecs` adds *optional* codecs on top:
 
@@ -84,6 +87,123 @@ Special values:
 
 Example: `codecs: jpeg-xl,openjpeg,exr,ppm` produces a build with JPEG-XL,
 JPEG2000, OpenEXR and PPM support.
+
+#### PNG backend: libpng or libspng
+
+libvips links **one** PNG backend, so `spng` is not a codec that sits next to PNG —
+selecting it swaps libvips over to libspng (`-Dpng=disabled -Dspng=enabled`) and
+libpng is left out of the library.
+
+* The `pngload` / `pngsave` operations, `vips_image_new_from_file()`,
+  `vips_image_write_to_file()` and the C++ `vips::VImage::pngsave()` all keep
+  working whichever backend was chosen.
+* The C convenience wrappers `vips_pngload()`, `vips_pngload_buffer()` and
+  `vips_pngsave()` live in `libvips/foreign/pngload.c` / `pngsave.c` *outside* their
+  `#ifdef HAVE_PNG` block, so they are compiled even when spng is selected. Nothing
+  else in the library references them, so `-Wl,--gc-sections` would drop them from
+  the Windows DLL; `build-scripts/win.sh` names them with `-Wl,--undefined=` to keep
+  them exported. The spng build therefore exports the same C API as the libpng one.
+* `versions.json` reports `spng` instead of `png` so the manifest matches what was
+  actually linked.
+
+### Build presets (`PRESET`) and single features (`FEATURES`)
+
+`PRESET` trades formats for size. It disables whole dependency chains that are heavy
+to link and rarely used by an image pipeline, and it applies to every build script
+(`build.sh`, `build-selectable.sh`, `build-selectable.ps1`, and the workflows'
+`preset` input) because `build-scripts/codecs.sh` translates it into libvips meson
+flags *and* the dependency install/build steps.
+
+| `PRESET` | what stays | what is dropped |
+| -------- | ---------- | --------------- |
+| `full` (or `0`) | everything | nothing |
+| `lean` (or `1`) | JPEG, PNG/libspng, WebP, TIFF, AVIF, HEIC decode, GIF load **and save**, `dzsave`, imagequant, EXIF, LCMS, highway | librsvg (+ fontconfig, harfbuzz, pixman, cairo, freetype, expat) → `svgload`; pango + fribidi → `textload`; libuhdr (UltraHDR gain maps); x265 (HEVC **encode**) |
+| `aggressive` (or `2`) | as above minus TIFF, `dzsave` and GIF saving | the `lean` list **plus** libtiff → `tiffload` / `tiffsave`, libarchive → `dzsave`, libimagequant → quantisation and `gifsave` (`gifload` stays) |
+| `image` | as `aggressive`, plus GIF saving and the quantiser | the `aggressive` list, **except** libimagequant is kept: `gifsave` and the quantised PNG/WebP saving paths remain |
+
+`FEATURES` then flips single formats on top of whatever preset was chosen, as
+comma-separated `name=on|off` pairs:
+
+| Feature | Turns on/off |
+| ------- | ------------ |
+| `svgload` | `svgload` (librsvg + the cairo/pixman/fontconfig/harfbuzz stack) |
+| `textload` | `textload` (pango + fribidi) |
+| `uhdr` | UltraHDR gain maps (libuhdr) |
+| `tiffload` | `tiffload` / `tiffsave` (libtiff) |
+| `dzsave` | `dzsave` (libarchive) |
+| `imagequant` | the quantiser (libimagequant): **`gifsave`** plus the quantised PNG/WebP saving paths |
+| `exif` | EXIF read/write through libexif instead of GExiv2 |
+| `lcms` | colour management (little cms) |
+| `heif_dec` | HEIC/HEVC **decode** through libde265 |
+| `heif_enc` | HEVC/HEIC **encode** through x265 (GPL-2.0-or-later, ~21 MB) |
+
+Example - the smallest build that still writes HEIC and GIF files:
+
+```bash
+PRESET=aggressive FEATURES=heif_enc=on,imagequant=on bash build.sh win-x64
+```
+
+`PRESET` defaults to `full` for `build.sh` and for an unattended
+`build-selectable.sh`. An inherited `PRESET` (or the old `LEAN`) environment
+variable is what `build-selectable.sh` falls back to when `--preset` is not given —
+that is how the workflows pass their input down — and an explicit `--preset` always
+wins over the environment. The interactive prompts in `build-selectable.sh` and
+`build-selectable.ps1`, and the `Build (selectable OS + codecs)` workflow, offer
+`lean` as their default. `LEAN=0/1/2`, `--lean` and `HEIF_HEVC_ENCODER` still work
+as aliases for the equivalent preset/feature.
+
+Details worth knowing:
+
+- `svgload` / `svgload_buffer` are the only users of librsvg, and libvips has no
+  `svgsave`, so trimming librsvg removes loading only.
+- `thumbnail` keeps working at every level: it goes through `VipsForeignLoad` and,
+  for HEIF/AVIF, through libheif's own thumbnail loader — it never needs librsvg or
+  pango.
+- `dzsave` is libvips' only use of libarchive, so it disappears with the
+  `aggressive` and `image` presets.
+- UltraHDR (`vips_heifsave(..., "uhdr", ...)`) needs libuhdr; AVIF and HEIF still
+  work without it.
+- HEIF/HEIC **decode** comes from libde265, which `build-scripts/posix.sh` builds
+  from source (`VERSION_DE265` in `versions.properties`) and which Windows installs
+  as an MSYS2 package - whenever `heif_dec` is on, i.e. in every preset unless it is
+  explicitly switched off with `FEATURES=heif_dec=off`. HEVC **encode** needs x265
+  (`heif_enc`), which is GPL-2.0-or-later and about 21 MB, so only `full` builds it
+  without an explicit `FEATURES=heif_enc=on`.
+- Without libimagequant (`imagequant=off`) the `vips__quantise_*` helpers are gone, and
+  with them the quantised PNG/WebP saving paths - libvips 8.18 has no separate
+  `quantise` or `dbsat` operation any more, the quantiser is internal to the savers.
+  GIF **saving** goes too: libvips compiles `cgifsave.c` only when a
+  quantiser is available (`HAVE_CGIF && HAVE_QUANTIZATION`), so such a build still
+  reads GIFs (`gifload`) but cannot write them. Use the `image` preset or
+  `FEATURES=imagequant=on` if the package must save GIFs.
+- Trimming is visible in the binary. Measured on the Windows x64 DLL (libvips
+  8.18.7, `CODECS=spng,openjpeg,jpeg-xl,nsgif`, before libde265 was added): `full`
+  is 73.10 MiB with 1601
+  `vips_*` exports, `lean` is 29.61 MiB with 1569 — the 32 that go are
+  `vips_svgload*`, `vips_text`, `vips_uhdrload*`, `vips_uhdrsave*`, their
+  `VipsForeignLoad*` / `VipsForeignSave*` types and the `vips__uhdr_*` helpers —
+  and `aggressive` is 25.72 MiB with 1512, so 89 exports in total, adding
+  `vips_tiff*`, `vips_dzsave*`, `vips_gifsave*`, `vips__quantise_*` and
+  `vips__archive_*`. The import table shrinks as well: `lean` loses
+  `DWrite.dll`, `GDI32.dll`, `gdiplus.dll`, `MSIMG32.dll`, `bcrypt.dll`,
+  `RPCRT4.dll` and `USP10.dll`.
+- Measured with the current dependency set, `image` is 26.8 MiB, and
+  `image` plus `FEATURES=heif_enc=on` is 48.2 MiB with 1636 exports: HEIC encode
+  adds no exports at all — `vips_heifsave` was already there — it only makes that
+  one entry point able to write `.heic`, because x265 (~21 MB) is linked in.
+- Code that calls a trimmed C entry point directly does not link against a trimmed
+  package at all — the linker reports `undefined reference to 'vips_svgload'` — so
+  such code needs a full build.
+- The C++ API is unaffected either way: `vips::VImage::svgload()` and friends are
+  generated as operation-name dispatches rather than direct calls to
+  `vips_svgload()`, so a program that uses them still compiles and links against a
+  trimmed DLL, and the call fails at runtime with
+  `VipsOperation: class "svgload" not found`, thrown as a `vips::VError`. That is
+  why `cplusplus/vips8` carries no per-format `#ifdef`: one header serves every
+  trim level.
+- The preset is recorded as `"preset"` and the resolved feature list as `"features"`
+  in the artifact's `versions.json`, and `build-scripts/smoke-test.sh` reads them so
+  a trimmed build is not failed for the formats it deliberately left out.
 
 ### Not built from source
 
@@ -144,6 +264,34 @@ Each platform uploads `libvips-<platform>.tar.gz` as a workflow artifact named
 `build-linux-arm64`, `build-win-x64`). Download them from the run's *Artifacts*
 section, or enable `create_release` to also publish them as a Release.
 
+### Verifying a build
+
+`build-scripts/smoke-test.sh` compiles `build-scripts/smoke-test.c` against the
+package in `target/` and runs it. It checks that the operations belonging to the
+requested codecs were compiled in, then encodes and decodes PNG, JPEG, TIFF, WebP
+and AVIF — plus JPEG 2000, JPEG XL and GIF when those codecs were selected — and
+writes a deep-zoom tree. `build-scripts/win.sh` runs it against the finished package
+just before the tarball is made; `build-scripts/posix.sh` runs it straight after
+`meson install`, since that script deletes `target/lib/pkgconfig` - the only place
+`vips.pc` is guaranteed to exist - and then filters and renames `target/lib` before
+packaging. Either way, a library that cannot actually load and save images fails the
+build instead of failing whoever downloads it; set `SMOKE_TEST=0` to skip that step.
+
+It reads the trim level from `LEAN`, or from the `"lean"` entry the build wrote to
+`target/versions.json`, and reports the formats trimming removed as trimmed rather
+than counting them as failures.
+
+```sh
+bash build.sh win-x64
+bash build-scripts/smoke-test.sh spng openjpeg jpeg-xl nsgif
+```
+
+It exits non-zero when a requested codec is missing, which makes it the quickest way
+to confirm a selection really made it into the library. Saving goes through
+`vips_image_write_to_file()` rather than the format-specific wrappers, because a
+trimmed build does not export those at all — calling `vips_dzsave()` or
+`vips_svgload()` directly against a trimmed package fails at link time.
+
 ## Building from a terminal, with a menu
 
 The same thing the selectable Action does, but locally:
@@ -172,7 +320,7 @@ by number, range, name or shortcut:
 `--list-codecs` prints the catalogue without building anything:
 
 ```text
-spng        PNG via libspng
+spng        PNG via libspng (replaces the libpng backend)
 openjpeg    JPEG 2000 (jp2)
 openexr     OpenEXR (exr), also builds Imath
 jpeg-xl     JPEG XL (jxl), also builds brotli + highway
@@ -187,7 +335,8 @@ qoi         QOI (built in, needs libvips >= 8.19)
 nsgif       GIF loading (built in, no dependency)
 ```
 
-Options: `-p/--platforms`, `-c/--codecs`, `-v/--version`, `-i/--interactive`,
+Options: `-p/--platforms`, `-c/--codecs`, `--lean` (`full`/`lean`/`aggressive` or
+`0`/`1`/`2`), `-v/--version`, `-i/--interactive`,
 `-y/--yes` (ask nothing), `--clean` / `--no-clean`, `--dry-run`,
 `--list-codecs`, `--list-platforms`, `-h/--help`.
 
@@ -209,6 +358,7 @@ build actually supports. `--version 8.19.0` rewrites `VERSION_VIPS` in
 | `build-selectable.bat`        | Windows       | Starts `build-selectable.ps1` from cmd.exe / double-click                  |
 | `build-scripts/codecs.sh`     | All           | Shared `CODECS` parsing + libvips meson feature flags                      |
 | `build-scripts/gen-implib.sh` | Windows       | Rebuilds the `libvips.dll.a` import library against the shipped DLL        |
+| `build-scripts/smoke-test.sh` | All           | Builds `smoke-test.c` against `target/` and round-trips the selected codecs; `win.sh` / `posix.sh` run it before packaging |
 | `build-scripts/posix.sh`      | macOS + Linux | Full source build, statically links deps into one shared lib               |
 | `build-scripts/win.sh`        | Windows       | MSYS2 (UCRT64) source build, statically links deps into one DLL            |
 
