@@ -64,6 +64,9 @@ jobs:
       CODECS: ${{ inputs.codecs }}
       PRESET: ${{ inputs.preset }}
       FEATURES: ${{ inputs.features }}
+      # posix.sh keeps the macOS Rust toolchain here rather than inside deps/, which
+      # is wiped between runs, so the cache step below can hand it back next time.
+      RUST_CACHE: ${{ github.workspace }}/.rust-cache
     strategy:
       fail-fast: false
       matrix:
@@ -82,18 +85,61 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Every dependency source is pinned in versions.properties, so an archive is the
+      # same bytes on the next run and build-scripts/fetch.sh can unpack it from
+      # .dl-cache instead of downloading it again - that removes ~40 fetches, including
+      # the libvips and libjxl tarballs, from a build.  Keys are per platform because
+      # each platform builds a different subset of the dependency list; the version is
+      # in the key so a new libvips release cannot reuse the old tarball.
+      - name: Cache dependency sources
+        if: inputs.platforms == '' || contains(inputs.platforms, matrix.platform)
+        uses: actions/cache@v6
+        with:
+          path: .dl-cache
+          key: dl-${{ matrix.platform }}-${{ inputs.version }}-${{ hashFiles('versions.properties') }}
+          restore-keys: |
+            dl-${{ matrix.platform }}-${{ inputs.version }}-
+            dl-${{ matrix.platform }}-
+
+      # Bottles and wheels for the tools the macOS build installs.
+      - name: Cache macOS tool downloads
+        if: runner.os == 'macOS' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            ~/.cache/pip
+          key: mac-tools-${{ runner.arch }}-${{ hashFiles('.github/workflows/build.yml') }}
+
+      # rustup + cargo-c, which posix.sh installs on macOS to build librsvg; cargo-c is
+      # compiled from crates, so reusing it saves several minutes.  Keyed on the script
+      # that installs them: a change there rebuilds the toolchain rather than reusing
+      # one built with different options.
+      - name: Cache Rust toolchain (macOS)
+        if: runner.os == 'macOS' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        uses: actions/cache@v6
+        with:
+          path: .rust-cache
+          key: rust-${{ matrix.platform }}-${{ hashFiles('build-scripts/posix.sh') }}
+          restore-keys: |
+            rust-${{ matrix.platform }}-
+
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
           pipx install meson
           brew install automake nasm
 
+      # setup-msys2 caches the MSYS2 installation and its pacman package downloads
+      # between runs by default; it is spelled out here because `update: true` runs a
+      # full pacman upgrade, which is only cheap when those packages are cached.
       - name: Setup MSYS2 (Windows)
         if: matrix.platform == 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: true
+          cache: true
           install: >-
             patch
             make
@@ -113,8 +159,19 @@ jobs:
         shell: msys2 {0}
         run: bash build.sh win-x64
 
+      # The Linux builds run inside a container whose image is the entire toolchain
+      # (dnf packages, rustup + cargo-c, meson/ninja).  BuildKit stores those layers in
+      # the GitHub Actions cache backend, so only the dependency build itself runs
+      # again; --pull is still used, and a new rockylinux:8 digest invalidates the
+      # cached layers, so the toolchain cannot drift silently.
+      - name: Set up Docker Buildx
+        if: (matrix.platform == 'linux-x64' || matrix.platform == 'linux-arm64') && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        uses: docker/setup-buildx-action@v4
+
       - name: Build (Unix)
         if: matrix.platform != 'win-x64' && (inputs.platforms == '' || contains(inputs.platforms, matrix.platform))
+        env:
+          DOCKER_BUILD_CACHE: ${{ (matrix.platform == 'linux-x64' || matrix.platform == 'linux-arm64') && '1' || '' }}
         run: bash build.sh ${{ matrix.platform }}
 
       # The build scripts already smoke test the build tree, which is the right

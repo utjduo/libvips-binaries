@@ -72,9 +72,13 @@ fi
 if [ "$DARWIN" = true ]; then
   # Let macOS linker remove unused code
   export LDFLAGS+=" -Wl,-dead_strip"
-  # Local rust installation
-  export CARGO_HOME="${DEPS}/cargo"
-  export RUSTUP_HOME="${DEPS}/rustup"
+  # Local rust installation.  RUST_CACHE lets a CI run point it at a directory that
+  # survives the build (the workflows cache .rust-cache), so rustup and the
+  # several-minute cargo-c compile are not repeated on every run.  The default keeps
+  # it inside $DEPS exactly as before.
+  RUST_CACHE="${RUST_CACHE:-$DEPS}"
+  export CARGO_HOME="${RUST_CACHE}/cargo"
+  export RUSTUP_HOME="${RUST_CACHE}/rustup"
   mkdir -p $CARGO_HOME
   mkdir -p $RUSTUP_HOME
   export PATH="${CARGO_HOME}/bin:${PATH}"
@@ -108,6 +112,13 @@ unset PKG_CONFIG_PATH
 # Common options for curl
 CURL="curl --silent --location --retry 3 --retry-max-time 30"
 
+# fetch_archive <url> <destination dir> [extra tar options] comes from
+# build-scripts/fetch.sh and is shared with the Windows build.  Archives are kept in
+# ${PACKAGE}/.dl-cache - inside the workspace on macOS, and inside the mounted
+# /packaging directory on Linux, so the container writes straight into the directory
+# the CI workflow caches - and are reused instead of being downloaded again.
+source "${PACKAGE}/build-scripts/fetch.sh"
+
 # Codec selection (shared with the Windows build)
 source "${PACKAGE}/build-scripts/codecs.sh"
 echo "libvips codec flags:${VIPS_CODEC_FLAGS}"
@@ -126,24 +137,31 @@ fi
 
 if [ "$DARWIN" = true ] && [ "${HAVE_SVG}" = 1 ]; then
   # Rust + cargo-c are only here to build librsvg; a trimmed build does not need them.
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain nightly
+  # Both live in $CARGO_HOME/$RUSTUP_HOME, which CI can point at a cached directory,
+  # so each step is skipped when it is already there - cargo install refuses to
+  # overwrite an existing installation without --force, which would stop the build.
+  if [ ! -x "${CARGO_HOME}/bin/rustup" ]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain nightly
+  fi
   export RUSTFLAGS+=" -Zlocation-detail=none -Zfmt-debug=none"
-  CFLAGS= cargo install cargo-c --locked
+  if ! cargo capi --version >/dev/null 2>&1; then
+    CFLAGS= cargo install cargo-c --locked
+  fi
 fi
 
 if [ "${PLATFORM%-*}" == "linuxmusl" ] || [ "$DARWIN" = true ]; then
   # musl and macOS requires the standalone intl support library of gettext, since it's not provided by libc (like GNU).
   # We use a stub version of gettext instead, since we don't need any of the i18n features.
   mkdir ${DEPS}/proxy-libintl
-  $CURL https://github.com/frida/proxy-libintl/archive/${VERSION_PROXY_LIBINTL}.tar.gz | tar xzC ${DEPS}/proxy-libintl --strip-components=1
+  fetch_archive "https://github.com/frida/proxy-libintl/archive/${VERSION_PROXY_LIBINTL}.tar.gz" "${DEPS}/proxy-libintl"
   cd ${DEPS}/proxy-libintl
   meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON}
   meson install -C _build --tag devel
 fi
 
 mkdir ${DEPS}/zlib-ng
-$CURL https://github.com/zlib-ng/zlib-ng/archive/${VERSION_ZLIB_NG}.tar.gz | tar xzC ${DEPS}/zlib-ng --strip-components=1
+fetch_archive "https://github.com/zlib-ng/zlib-ng/archive/${VERSION_ZLIB_NG}.tar.gz" "${DEPS}/zlib-ng"
 cd ${DEPS}/zlib-ng
 CFLAGS="${CFLAGS} -O3" cmake -G"Unix Makefiles" \
   -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
@@ -151,14 +169,14 @@ CFLAGS="${CFLAGS} -O3" cmake -G"Unix Makefiles" \
 make install/strip
 
 mkdir ${DEPS}/ffi
-$CURL https://github.com/libffi/libffi/releases/download/v${VERSION_FFI}/libffi-${VERSION_FFI}.tar.gz | tar xzC ${DEPS}/ffi --strip-components=1
+fetch_archive "https://github.com/libffi/libffi/releases/download/v${VERSION_FFI}/libffi-${VERSION_FFI}.tar.gz" "${DEPS}/ffi"
 cd ${DEPS}/ffi
 ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
   --disable-builddir --disable-multi-os-directory --disable-raw-api --disable-structs --disable-docs
 make install-strip
 
 mkdir ${DEPS}/glib
-$CURL https://download.gnome.org/sources/glib/$(without_patch $VERSION_GLIB)/glib-${VERSION_GLIB}.tar.xz | tar xJC ${DEPS}/glib --strip-components=1
+fetch_archive "https://download.gnome.org/sources/glib/$(without_patch $VERSION_GLIB)/glib-${VERSION_GLIB}.tar.xz" "${DEPS}/glib"
 cd ${DEPS}/glib
 $CURL https://gist.github.com/kleisauke/284d685efa00908da99ea6afbaaf39ae/raw/bdad5489a61c217850631571caf57f5db6ea8b2c/glib-without-gregex.patch | patch -p1
 meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} --datadir=${TARGET}/share ${MESON} \
@@ -168,7 +186,7 @@ meson setup _build --default-library=static --buildtype=release --strip --prefix
 meson install -C _build --tag bin-devel,devel
 
 mkdir ${DEPS}/xml2
-$CURL https://download.gnome.org/sources/libxml2/$(without_patch $VERSION_XML2)/libxml2-${VERSION_XML2}.tar.xz | tar xJC ${DEPS}/xml2 --strip-components=1
+fetch_archive "https://download.gnome.org/sources/libxml2/$(without_patch $VERSION_XML2)/libxml2-${VERSION_XML2}.tar.xz" "${DEPS}/xml2"
 cd ${DEPS}/xml2
 meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
   -Dminimum=true
@@ -176,7 +194,7 @@ meson install -C _build --tag devel
 
 if [ "${HAVE_EXIF}" = 1 ]; then
   mkdir ${DEPS}/exif
-  $CURL https://github.com/libexif/libexif/releases/download/v${VERSION_EXIF}/libexif-${VERSION_EXIF}.tar.xz | tar xJC ${DEPS}/exif --strip-components=1
+  fetch_archive "https://github.com/libexif/libexif/releases/download/v${VERSION_EXIF}/libexif-${VERSION_EXIF}.tar.xz" "${DEPS}/exif"
   cd ${DEPS}/exif
   ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
     --disable-nls --disable-docs --without-libiconv-prefix --without-libintl-prefix \
@@ -186,7 +204,7 @@ fi
 
 if [ "${HAVE_LCMS}" = 1 ]; then
   mkdir ${DEPS}/lcms
-  $CURL https://github.com/mm2/Little-CMS/releases/download/lcms${VERSION_LCMS}/lcms2-${VERSION_LCMS}.tar.gz | tar xzC ${DEPS}/lcms --strip-components=1
+  fetch_archive "https://github.com/mm2/Little-CMS/releases/download/lcms${VERSION_LCMS}/lcms2-${VERSION_LCMS}.tar.gz" "${DEPS}/lcms"
   cd ${DEPS}/lcms
   CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
     -Dtests=disabled
@@ -194,7 +212,7 @@ if [ "${HAVE_LCMS}" = 1 ]; then
 fi
 
 mkdir ${DEPS}/aom
-$CURL https://storage.googleapis.com/aom-releases/libaom-${VERSION_AOM}.tar.gz | tar xzC ${DEPS}/aom --strip-components=1
+fetch_archive "https://storage.googleapis.com/aom-releases/libaom-${VERSION_AOM}.tar.gz" "${DEPS}/aom"
 cd ${DEPS}/aom
 mkdir aom_build
 cd aom_build
@@ -214,7 +232,7 @@ make install/strip
 HEIF_DECODER=0
 if [ "${HAVE_HEIF_DEC}" = 1 ]; then
   mkdir ${DEPS}/de265
-  $CURL https://github.com/strukturag/libde265/releases/download/v${VERSION_DE265}/libde265-${VERSION_DE265}.tar.gz | tar xzC ${DEPS}/de265 --strip-components=1
+  fetch_archive "https://github.com/strukturag/libde265/releases/download/v${VERSION_DE265}/libde265-${VERSION_DE265}.tar.gz" "${DEPS}/de265"
   if ( cd ${DEPS}/de265 && cmake -G"Unix Makefiles" \
       -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=MinSizeRel \
       -DBUILD_SHARED_LIBS=FALSE -DENABLE_DECODER=0 -DENABLE_ENCODER=0 -DENABLE_SHERLOCK265=0 -DENABLE_INTERNAL_DEVELOPMENT_TOOLS=0 \
@@ -241,7 +259,7 @@ if [ "${HAVE_HEIF_ENC}" = 1 ]; then
 fi
 
 mkdir ${DEPS}/heif
-$CURL https://github.com/strukturag/libheif/archive/${VERSION_HEIF}.tar.gz | tar xzC ${DEPS}/heif --strip-components=1
+fetch_archive "https://github.com/strukturag/libheif/archive/${VERSION_HEIF}.tar.gz" "${DEPS}/heif"
 cd ${DEPS}/heif
 CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
   -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
@@ -249,7 +267,7 @@ CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
 make install/strip
 
 mkdir ${DEPS}/jpeg
-$CURL https://github.com/mozilla/mozjpeg/archive/${VERSION_MOZJPEG}.tar.gz | tar xzC ${DEPS}/jpeg --strip-components=1
+fetch_archive "https://github.com/mozilla/mozjpeg/archive/${VERSION_MOZJPEG}.tar.gz" "${DEPS}/jpeg"
 cd ${DEPS}/jpeg
 # [PATCH] fix: use saturating arithmetic in SIMD FDCT to prevent overflow
 $CURL https://github.com/mozilla/mozjpeg/commit/f90668e0e4fb79c81e1f24a0ccc0e2090af761bf.patch | patch -p1
@@ -261,7 +279,7 @@ cmake -G"Unix Makefiles" \
 make install/strip
 
 mkdir ${DEPS}/png
-$CURL https://github.com/pnggroup/libpng/archive/v${VERSION_PNG}.tar.gz | tar xzC ${DEPS}/png --strip-components=1
+fetch_archive "https://github.com/pnggroup/libpng/archive/v${VERSION_PNG}.tar.gz" "${DEPS}/png"
 cd ${DEPS}/png
 ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
   --disable-tools --without-binconfigs --disable-unversioned-libpng-config
@@ -269,14 +287,14 @@ make install-strip dist_man_MANS=
 
 if [ "${HAVE_IMAGEQUANT}" = 1 ]; then
   mkdir ${DEPS}/imagequant
-  $CURL https://github.com/lovell/libimagequant/archive/v${VERSION_IMAGEQUANT}.tar.gz | tar xzC ${DEPS}/imagequant --strip-components=1
+  fetch_archive "https://github.com/lovell/libimagequant/archive/v${VERSION_IMAGEQUANT}.tar.gz" "${DEPS}/imagequant"
   cd ${DEPS}/imagequant
   CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON}
   meson install -C _build --tag devel
 fi
 
 mkdir ${DEPS}/webp
-$CURL https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${VERSION_WEBP}.tar.gz | tar xzC ${DEPS}/webp --strip-components=1
+fetch_archive "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${VERSION_WEBP}.tar.gz" "${DEPS}/webp"
 cd ${DEPS}/webp
 ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
   --enable-libwebpmux --enable-libwebpdemux ${WITHOUT_NEON:+--disable-neon}
@@ -284,7 +302,7 @@ make install-strip bin_PROGRAMS= noinst_PROGRAMS= man_MANS=
 
 if [ "${HAVE_TIFF}" = 1 ]; then
   mkdir ${DEPS}/tiff
-  $CURL https://gitlab.com/libtiff/libtiff/-/archive/${VERSION_TIFF}/libtiff-${VERSION_TIFF}.tar.gz | tar xzC ${DEPS}/tiff --strip-components=1
+  fetch_archive "https://gitlab.com/libtiff/libtiff/-/archive/${VERSION_TIFF}/libtiff-${VERSION_TIFF}.tar.gz" "${DEPS}/tiff"
   cd ${DEPS}/tiff
   cmake -G"Unix Makefiles" \
     -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=MinSizeRel \
@@ -296,7 +314,7 @@ fi
 
 if [ -z "$WITHOUT_HIGHWAY" ] || codec_on jpeg-xl; then
   mkdir ${DEPS}/highway
-  $CURL https://github.com/google/highway/archive/${VERSION_HIGHWAY}.tar.gz | tar xzC ${DEPS}/highway --strip-components=1
+  fetch_archive "https://github.com/google/highway/archive/${VERSION_HIGHWAY}.tar.gz" "${DEPS}/highway"
   cd ${DEPS}/highway
   CFLAGS="${CFLAGS} -O3" CXXFLAGS="${CXXFLAGS} -O3" cmake -G"Unix Makefiles" \
     -DCMAKE_TOOLCHAIN_FILE=${ROOT}/Toolchain.cmake -DCMAKE_INSTALL_PREFIX=${TARGET} -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_TYPE=Release \
@@ -307,7 +325,7 @@ fi
 build_freetype() {
   rm -rf ${DEPS}/freetype
   mkdir ${DEPS}/freetype
-  $CURL https://github.com/freetype/freetype/archive/VER-${VERSION_FREETYPE//./-}.tar.gz | tar xzC ${DEPS}/freetype --strip-components=1
+  fetch_archive "https://github.com/freetype/freetype/archive/VER-${VERSION_FREETYPE//./-}.tar.gz" "${DEPS}/freetype"
   cd ${DEPS}/freetype
   meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
     -Dzlib=enabled -Dpng=enabled -Dbrotli=disabled -Dbzip2=disabled "$@"
@@ -321,7 +339,7 @@ build_freetype() {
 #   Run-time dependency expat found: NO (tried pkgconfig)
 # It must therefore be built even when svgload and textload are trimmed.
 mkdir ${DEPS}/expat
-$CURL https://github.com/libexpat/libexpat/releases/download/R_${VERSION_EXPAT//./_}/expat-${VERSION_EXPAT}.tar.xz | tar xJC ${DEPS}/expat --strip-components=1
+fetch_archive "https://github.com/libexpat/libexpat/releases/download/R_${VERSION_EXPAT//./_}/expat-${VERSION_EXPAT}.tar.xz" "${DEPS}/expat"
 cd ${DEPS}/expat
 ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared \
   --disable-dependency-tracking --without-xmlwf --without-docbook --without-getrandom --without-sys-getrandom \
@@ -340,7 +358,7 @@ fi
 
 if [ "${HAVE_DZSAVE}" = 1 ]; then
   mkdir ${DEPS}/archive
-  $CURL https://github.com/libarchive/libarchive/releases/download/v${VERSION_ARCHIVE}/libarchive-${VERSION_ARCHIVE}.tar.xz | tar xJC ${DEPS}/archive --strip-components=1
+  fetch_archive "https://github.com/libarchive/libarchive/releases/download/v${VERSION_ARCHIVE}/libarchive-${VERSION_ARCHIVE}.tar.xz" "${DEPS}/archive"
   cd ${DEPS}/archive
   ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
     --disable-bsdtar --disable-bsdcat --disable-bsdcpio --disable-bsdunzip --disable-posix-regex-lib --disable-xattr --disable-acl \
@@ -351,7 +369,7 @@ fi
 
 if [ "${NEED_VECTOR_TEXT}" = 1 ]; then
   mkdir ${DEPS}/fontconfig
-  $CURL https://gitlab.freedesktop.org/fontconfig/fontconfig/-/archive/${VERSION_FONTCONFIG}/fontconfig-${VERSION_FONTCONFIG}.tar.gz | tar xzC ${DEPS}/fontconfig --strip-components=1
+  fetch_archive "https://gitlab.freedesktop.org/fontconfig/fontconfig/-/archive/${VERSION_FONTCONFIG}/fontconfig-${VERSION_FONTCONFIG}.tar.gz" "${DEPS}/fontconfig"
   cd ${DEPS}/fontconfig
   # Disable install of gettext files
   sed -i'.bak' "/subdir('its')/d" meson.build
@@ -362,7 +380,7 @@ if [ "${NEED_VECTOR_TEXT}" = 1 ]; then
   meson install -C _build --tag devel
 
   mkdir ${DEPS}/harfbuzz
-  $CURL https://github.com/harfbuzz/harfbuzz/archive/${VERSION_HARFBUZZ}.tar.gz | tar xzC ${DEPS}/harfbuzz --strip-components=1
+  fetch_archive "https://github.com/harfbuzz/harfbuzz/archive/${VERSION_HARFBUZZ}.tar.gz" "${DEPS}/harfbuzz"
   cd ${DEPS}/harfbuzz
   meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
     -Dgobject=disabled -Dicu=disabled -Dtests=disabled -Dintrospection=disabled -Ddocs=disabled -Dbenchmark=disabled -Dutilities=disabled \
@@ -373,7 +391,7 @@ if [ "${NEED_VECTOR_TEXT}" = 1 ]; then
   build_freetype -Dharfbuzz=enabled
 
   mkdir ${DEPS}/pixman
-  $CURL https://cairographics.org/releases/pixman-${VERSION_PIXMAN}.tar.gz | tar xzC ${DEPS}/pixman --strip-components=1
+  fetch_archive "https://cairographics.org/releases/pixman-${VERSION_PIXMAN}.tar.gz" "${DEPS}/pixman"
   cd ${DEPS}/pixman
   meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
     -Dlibpng=disabled -Dgtk=disabled -Dopenmp=disabled -Dtests=disabled -Ddemos=disabled \
@@ -381,7 +399,7 @@ if [ "${NEED_VECTOR_TEXT}" = 1 ]; then
   meson install -C _build --tag devel
 
   mkdir ${DEPS}/cairo
-  $CURL https://cairographics.org/releases/cairo-${VERSION_CAIRO}.tar.xz | tar xJC ${DEPS}/cairo --strip-components=1
+  fetch_archive "https://cairographics.org/releases/cairo-${VERSION_CAIRO}.tar.xz" "${DEPS}/cairo"
   cd ${DEPS}/cairo
   meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
     ${LINUX:+-Dquartz=disabled} ${DARWIN:+-Dquartz=enabled} -Dfreetype=enabled -Dfontconfig=enabled -Dtee=disabled -Dxcb=disabled -Dxlib=disabled -Dzlib=disabled \
@@ -391,14 +409,14 @@ fi
 
 if [ "${HAVE_TEXT_STACK}" = 1 ]; then
   mkdir ${DEPS}/fribidi
-  $CURL https://github.com/fribidi/fribidi/releases/download/v${VERSION_FRIBIDI}/fribidi-${VERSION_FRIBIDI}.tar.xz | tar xJC ${DEPS}/fribidi --strip-components=1
+  fetch_archive "https://github.com/fribidi/fribidi/releases/download/v${VERSION_FRIBIDI}/fribidi-${VERSION_FRIBIDI}.tar.xz" "${DEPS}/fribidi"
   cd ${DEPS}/fribidi
   meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
     -Ddocs=false -Dbin=false -Dtests=false
   meson install -C _build --tag devel
 
   mkdir ${DEPS}/pango
-  $CURL https://download.gnome.org/sources/pango/$(without_patch $VERSION_PANGO)/pango-${VERSION_PANGO}.tar.xz | tar xJC ${DEPS}/pango --strip-components=1
+  fetch_archive "https://download.gnome.org/sources/pango/$(without_patch $VERSION_PANGO)/pango-${VERSION_PANGO}.tar.xz" "${DEPS}/pango"
   cd ${DEPS}/pango
   # Disable utils and tools
   sed -i'.bak' "/subdir('utils')/{N;d;}" meson.build
@@ -409,7 +427,7 @@ fi
 
 if [ "${HAVE_SVG}" = 1 ]; then
   mkdir ${DEPS}/rsvg
-  $CURL https://download.gnome.org/sources/librsvg/$(without_patch $VERSION_RSVG)/librsvg-${VERSION_RSVG}.tar.xz | tar xJC ${DEPS}/rsvg --strip-components=1
+  fetch_archive "https://download.gnome.org/sources/librsvg/$(without_patch $VERSION_RSVG)/librsvg-${VERSION_RSVG}.tar.xz" "${DEPS}/rsvg"
   cd ${DEPS}/rsvg
   # Disallow GIF and WebP embedded in SVG images
   sed -i'.bak' "/image = /s/, \"gif\", \"webp\"//" rsvg/Cargo.toml
@@ -428,7 +446,7 @@ if [ "${HAVE_SVG}" = 1 ]; then
 fi
 
 mkdir ${DEPS}/cgif
-$CURL https://github.com/dloebl/cgif/archive/v${VERSION_CGIF}.tar.gz | tar xzC ${DEPS}/cgif --strip-components=1
+fetch_archive "https://github.com/dloebl/cgif/archive/v${VERSION_CGIF}.tar.gz" "${DEPS}/cgif"
 cd ${DEPS}/cgif
 CFLAGS="${CFLAGS} -O3" meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
   -Dexamples=false -Dtests=false
@@ -436,7 +454,7 @@ meson install -C _build --tag devel
 
 if [ "${HAVE_UHDR}" = 1 ]; then
   mkdir ${DEPS}/uhdr
-  $CURL https://github.com/google/libultrahdr/archive/${VERSION_UHDR}.tar.gz | tar xzC ${DEPS}/uhdr --strip-components=1
+  fetch_archive "https://github.com/google/libultrahdr/archive/${VERSION_UHDR}.tar.gz" "${DEPS}/uhdr"
   cd ${DEPS}/uhdr
   # [PATCH] Remove platform and architecture detection logic
   $CURL https://patch-diff.githubusercontent.com/raw/google/libultrahdr/pull/383.patch | patch -p1
@@ -454,7 +472,7 @@ fi
 
 if codec_on spng; then
   mkdir ${DEPS}/spng
-  $CURL https://github.com/randy408/libspng/archive/v${VERSION_SPNG}.tar.gz | tar xzC ${DEPS}/spng --strip-components=1
+  fetch_archive "https://github.com/randy408/libspng/archive/v${VERSION_SPNG}.tar.gz" "${DEPS}/spng"
   cd ${DEPS}/spng
   meson setup _build --default-library=static --buildtype=release --strip --prefix=${TARGET} ${MESON} \
     -Dbuild_examples=false
@@ -463,7 +481,7 @@ fi
 
 if codec_on openjpeg; then
   mkdir ${DEPS}/openjpeg
-  $CURL https://github.com/uclouvain/openjpeg/archive/v${VERSION_OPENJPEG}.tar.gz | tar xzC ${DEPS}/openjpeg --strip-components=1
+  fetch_archive "https://github.com/uclouvain/openjpeg/archive/v${VERSION_OPENJPEG}.tar.gz" "${DEPS}/openjpeg"
   cd ${DEPS}/openjpeg
   mkdir build
   cd build
@@ -476,7 +494,7 @@ fi
 
 if codec_on openexr; then
   mkdir ${DEPS}/imath
-  $CURL https://github.com/AcademySoftwareFoundation/Imath/archive/v${VERSION_IMATH}.tar.gz | tar xzC ${DEPS}/imath --strip-components=1
+  fetch_archive "https://github.com/AcademySoftwareFoundation/Imath/archive/v${VERSION_IMATH}.tar.gz" "${DEPS}/imath"
   cd ${DEPS}/imath
   mkdir build
   cd build
@@ -487,7 +505,7 @@ if codec_on openexr; then
   make install/strip
 
   mkdir ${DEPS}/openexr
-  $CURL https://github.com/AcademySoftwareFoundation/openexr/archive/v${VERSION_OPENEXR}.tar.gz | tar xzC ${DEPS}/openexr --strip-components=1
+  fetch_archive "https://github.com/AcademySoftwareFoundation/openexr/archive/v${VERSION_OPENEXR}.tar.gz" "${DEPS}/openexr"
   cd ${DEPS}/openexr
   mkdir build
   cd build
@@ -500,7 +518,7 @@ fi
 
 if codec_on jpeg-xl; then
   mkdir ${DEPS}/brotli
-  $CURL https://github.com/google/brotli/archive/v${VERSION_BROTLI}.tar.gz | tar xzC ${DEPS}/brotli --strip-components=1
+  fetch_archive "https://github.com/google/brotli/archive/v${VERSION_BROTLI}.tar.gz" "${DEPS}/brotli"
   cd ${DEPS}/brotli
   mkdir build
   cd build
@@ -511,7 +529,7 @@ if codec_on jpeg-xl; then
   make install/strip
 
   mkdir ${DEPS}/jpeg-xl
-  $CURL https://github.com/libjxl/libjxl/archive/v${VERSION_JPEGXL}.tar.gz | tar xzC ${DEPS}/jpeg-xl --strip-components=1
+  fetch_archive "https://github.com/libjxl/libjxl/archive/v${VERSION_JPEGXL}.tar.gz" "${DEPS}/jpeg-xl"
   cd ${DEPS}/jpeg-xl
   mkdir build
   cd build
@@ -528,7 +546,7 @@ fi
 
 if codec_on fftw; then
   mkdir ${DEPS}/fftw
-  $CURL https://www.fftw.org/fftw-${VERSION_FFTW}.tar.gz | tar xzC ${DEPS}/fftw --strip-components=1
+  fetch_archive "https://www.fftw.org/fftw-${VERSION_FFTW}.tar.gz" "${DEPS}/fftw"
   cd ${DEPS}/fftw
   ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
     --disable-fortran --enable-threads
@@ -537,7 +555,7 @@ fi
 
 if codec_on cfitsio; then
   mkdir ${DEPS}/cfitsio
-  $CURL https://heasarc.gsfc.nasa.gov/FTP/software/fitsio/c/cfitsio-${VERSION_CFITSIO}.tar.gz | tar xzC ${DEPS}/cfitsio --strip-components=1
+  fetch_archive "https://heasarc.gsfc.nasa.gov/FTP/software/fitsio/c/cfitsio-${VERSION_CFITSIO}.tar.gz" "${DEPS}/cfitsio"
   cd ${DEPS}/cfitsio
   ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
     --disable-curl
@@ -547,7 +565,7 @@ fi
 
 if codec_on matio; then
   mkdir ${DEPS}/matio
-  $CURL https://github.com/tbeu/matio/releases/download/v${VERSION_MATIO}/matio-${VERSION_MATIO}.tar.gz | tar xzC ${DEPS}/matio --strip-components=1
+  fetch_archive "https://github.com/tbeu/matio/releases/download/v${VERSION_MATIO}/matio-${VERSION_MATIO}.tar.gz" "${DEPS}/matio"
   cd ${DEPS}/matio
   ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
     --without-hdf5 --disable-mat73
@@ -556,7 +574,7 @@ fi
 
 if codec_on raw; then
   mkdir ${DEPS}/raw
-  $CURL https://www.libraw.org/data/LibRaw-${VERSION_RAW}.tar.gz | tar xzC ${DEPS}/raw --strip-components=1
+  fetch_archive "https://www.libraw.org/data/LibRaw-${VERSION_RAW}.tar.gz" "${DEPS}/raw"
   cd ${DEPS}/raw
   ./configure --host=${CHOST} --prefix=${TARGET} --enable-static --disable-shared --disable-dependency-tracking \
     --disable-examples --disable-demos --disable-jasper
@@ -564,7 +582,7 @@ if codec_on raw; then
 fi
 
 mkdir ${DEPS}/vips
-$CURL https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips-${VERSION_VIPS}.tar.xz | tar xJC ${DEPS}/vips --strip-components=1
+fetch_archive "https://github.com/libvips/libvips/releases/download/v${VERSION_VIPS}/vips-${VERSION_VIPS}.tar.xz" "${DEPS}/vips"
 cd ${DEPS}/vips
 # Use version number in SONAME
 $CURL https://gist.githubusercontent.com/lovell/313a6901e9db1bf285f2a1f1180499e4/raw/3988223c7dfa4d22745d9392034b0117abef1446/libvips-cpp-soversion.patch | patch -p1

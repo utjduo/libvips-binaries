@@ -36,6 +36,15 @@ if [ $# -lt 1 ]; then
   echo "               FEATURES=tiff=on,heif_enc=on"
   echo "               features: svg text uhdr tiff dzsave imagequant exif lcms"
   echo "                         heif_dec heif_enc"
+  echo "- DL_CACHE       where the downloaded dependency sources are kept"
+  echo "               (default: .dl-cache in the workspace).  Every archive is pinned"
+  echo "               in versions.properties, so a warm directory means nothing has"
+  echo "               to be downloaded again.  See build-scripts/fetch.sh."
+  echo "- DOCKER_BUILD_CACHE"
+  echo "               set to reuse the layers of the Linux toolchain image instead of"
+  echo "               rebuilding them: the GitHub Actions cache backend when"
+  echo "               GITHUB_ACTIONS=true, otherwise .docker-cache/<platform>."
+  echo "               Requires docker buildx."
   echo
   echo "Note: Windows builds must be run from an MSYS2 shell (the build-scripts/win.sh"
   echo "script links every dependency statically into a single libvips DLL)."
@@ -97,7 +106,26 @@ fi
 for flavour in linux-x64 linux-arm64; do
   if [ $PLATFORM = $flavour ]; then
     echo "Building $flavour..."
-    docker build --pull -t "vips-dev-$flavour" "platforms/$flavour"
+    # The image is the whole toolchain (dnf packages, rustup + cargo-c, meson/ninja),
+    # and rebuilding those layers costs several minutes on every run.  With
+    # DOCKER_BUILD_CACHE set, BuildKit keeps them: the GitHub Actions cache backend
+    # in CI, a directory in the workspace locally.  --pull is kept either way, so a
+    # new rockylinux:8 digest still invalidates everything built on top of it.
+    if [ -n "${DOCKER_BUILD_CACHE:-}" ]; then
+      if [ "${GITHUB_ACTIONS:-}" = true ]; then
+        CACHE_ARGS=(--cache-from type=gha --cache-to type=gha,mode=max)
+      else
+        mkdir -p "$PWD/.docker-cache/$flavour"
+        CACHE_ARGS=(
+          --cache-from "type=local,src=$PWD/.docker-cache/$flavour"
+          --cache-to "type=local,dest=$PWD/.docker-cache/$flavour"
+        )
+      fi
+      docker buildx build --pull --load "${CACHE_ARGS[@]}" \
+        -t "vips-dev-$flavour" "platforms/$flavour"
+    else
+      docker build --pull -t "vips-dev-$flavour" "platforms/$flavour"
+    fi
     # PRESET is only forwarded when it was actually set: codecs.sh reads PRESET
     # before LEAN, so passing a default PRESET would silently override a LEAN=2
     # request from the caller or the Actions workflow.

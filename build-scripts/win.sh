@@ -50,44 +50,12 @@ mkdir -p "$DEPS" "$TARGET" "$IMPORT_LIBS"
 
 CURL="curl --silent --location --retry 3 --retry-max-time 30"
 
-# fetch_archive <url> <destination dir> [extra tar options]
-#
-# Piping $CURL straight into tar is fragile: curl without --fail writes the body of
-# an error page into the pipe, tar then unpacks nothing, and the build only dies
-# much later with something like
-#   CMake Error: The source directory ".../deps/jpeg-xl" does not appear to contain
-#   CMakeLists.txt.
-# GitHub source archives also end with a harmless "A lone zero block" warning that
-# makes tar exit non-zero even though everything unpacked, so the archive is fetched
-# to a file first, unpacked, and the unpacked tree is verified before continuing.
-fetch_archive() {
-  local url="$1" dest="$2"
-  shift 2
-  local tmp="$DEPS/.fetch-$(basename "$url")"
-  local attempt
-  mkdir -p "$DEPS"
-  for attempt in 1 2 3; do
-    if $CURL --fail -o "$tmp" "$url"; then
-      break
-    fi
-    echo "Warning: download failed (attempt $attempt/3): $url" >&2
-    sleep 5
-  done
-  if [ ! -s "$tmp" ]; then
-    echo "ERROR: could not download $url" >&2
-    exit 1
-  fi
-  mkdir -p "$dest"
-  # -a picks the compression from the file name; the lone-zero-block noise is
-  # filtered but anything else tar reports is kept.
-  tar -xaf "$tmp" -C "$dest" --strip-components=1 "$@" 2>&1 |
-    grep -v -e 'lone zero block' -e 'Ignoring bad extended header' >&2 || true
-  rm -f "$tmp"
-  if [ ! -d "$dest" ] || [ -z "$(ls -A "$dest" 2>/dev/null)" ]; then
-    echo "ERROR: $url unpacked into an empty directory: $dest" >&2
-    exit 1
-  fi
-}
+# fetch_archive <url> <destination dir> [extra tar options] comes from
+# build-scripts/fetch.sh and is shared with the posix build.  It keeps every archive
+# in $DL_CACHE - "$PACKAGE/.dl-cache", which is outside $DEPS and therefore survives
+# the wipe above - so a rebuild reuses the pinned sources instead of downloading the
+# whole dependency set again, and it only caches an archive that unpacked cleanly.
+source "$PACKAGE/build-scripts/fetch.sh"
 
 # config.guess reports the MSYS runtime as "x86_64-pc-cygwin" even in a UCRT64
 # shell, which makes configure scripts take the wrong platform branches - e.g.
