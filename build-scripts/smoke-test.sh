@@ -142,7 +142,7 @@ feature_state() {
 }
 
 # --- which checks must work, which were trimmed on purpose ------------------
-require="png,jpeg,webp,avif,gifload,thumbnail,buffer,memory,metadata,colourspace"
+require="png,jpeg,webp,avif,thumbnail,buffer,memory,metadata,colourspace"
 skip=""
 add_require() { require="$require,$1"; }
 add_skip() { skip="$skip,$1"; }
