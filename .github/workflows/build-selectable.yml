@@ -122,6 +122,9 @@ jobs:
             exit 1
           fi
           echo "Selected matrix: ${matrix}"
+          echo "Selected codecs: ${CODECS}"
+          echo "Selected presets: ${PRESET}"
+          echo "Selected features: ${FEATURES}"
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
 
   build:
