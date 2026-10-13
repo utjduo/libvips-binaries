@@ -101,6 +101,9 @@ jobs:
           LINUX_X64: ${{ inputs.linux_x64 }}
           LINUX_ARM: ${{ inputs.linux_arm }}
           WIN_X64: ${{ inputs.win_x64 }}
+          CODECS: ${{ inputs.codecs }}
+          PRESET: ${{ inputs.preset }}
+          FEATURES: ${{ inputs.features }}
         run: |
           matrix='{"include":['
           sep=''
